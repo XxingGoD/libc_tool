@@ -577,9 +577,10 @@ def run_doctor(input_path=None, reference_elf=None, output_dir=None, extra_neede
     )
 
     for name, host, port, required in (
-        ('network:launchpad', 'launchpad.net', 443, True),
+        ('network:launchpad', 'launchpad.net', 443, False),
         ('network:archive_ubuntu', 'archive.ubuntu.com', 80, True),
         ('network:security_ubuntu', 'security.ubuntu.com', 80, False),
+        ('network:old_releases_ubuntu', 'old-releases.ubuntu.com', 80, False),
         ('network:libc_rip', 'libc.rip', 443, False),
     ):
         ok, detail = tcp_probe(host, port)
@@ -766,27 +767,48 @@ def infer_ubuntu_release_from_libc(libc_path):
                     return ubuntu_ver
     return None
 
+def ensure_ubuntu_repo_root(base_url):
+    repo_root = (base_url or '').rstrip('/')
+    if not repo_root:
+        return None
+    if not repo_root.endswith('/ubuntu'):
+        repo_root += '/ubuntu'
+    return repo_root
+
 def iter_ubuntu_package_indexes(ubuntu_release, arch):
     codename = UBUNTU_CODENAME_MAP.get(ubuntu_release)
     if not codename:
         return
-    archive_base = os.environ.get('PWN_UBUNTU_ARCHIVE_URL', 'http://archive.ubuntu.com').rstrip('/')
-    security_base = os.environ.get('PWN_UBUNTU_SECURITY_URL', 'http://security.ubuntu.com').rstrip('/')
-    if not archive_base.endswith('/ubuntu'):
-        archive_base += '/ubuntu'
-    if not security_base.endswith('/ubuntu'):
-        security_base += '/ubuntu'
+    archive_base = ensure_ubuntu_repo_root(
+        os.environ.get('PWN_UBUNTU_ARCHIVE_URL', 'http://archive.ubuntu.com')
+    )
+    security_base = ensure_ubuntu_repo_root(
+        os.environ.get('PWN_UBUNTU_SECURITY_URL', 'http://security.ubuntu.com')
+    )
+    old_releases_base = ensure_ubuntu_repo_root(
+        os.environ.get('PWN_UBUNTU_OLD_RELEASES_URL', 'http://old-releases.ubuntu.com')
+    )
     pocket_roots = [
         (f'{codename}-updates', archive_base),
         (f'{codename}-security', security_base),
         (codename, archive_base),
+        (f'{codename}-updates', old_releases_base),
+        (f'{codename}-security', old_releases_base),
+        (codename, old_releases_base),
     ]
     components = ['main', 'universe', 'multiverse', 'restricted']
+    seen = set()
     for pocket, repo_root in pocket_roots:
+        if not repo_root:
+            continue
         for component in components:
+            index_url = f'{repo_root}/dists/{pocket}/{component}/binary-{arch}/Packages.gz'
+            if index_url in seen:
+                continue
+            seen.add(index_url)
             yield (
                 repo_root,
-                f'{repo_root}/dists/{pocket}/{component}/binary-{arch}/Packages.gz',
+                index_url,
             )
 
 def iter_debian_control_entries(text):
@@ -810,10 +832,11 @@ def iter_debian_control_entries(text):
     if entry:
         yield entry
 
-def find_ubuntu_package_url(package_names, ubuntu_release, arch):
+def find_ubuntu_package_url(package_names, ubuntu_release, arch, package_version=None, package_filename=None):
     if not package_names or not ubuntu_release or not arch:
         return None
     wanted = set(package_names)
+    exact_match_required = bool(package_version or package_filename)
     for repo_root, index_url in iter_ubuntu_package_indexes(ubuntu_release, arch):
         try:
             raw_data = libcdb.wget(index_url, timeout=20)
@@ -829,10 +852,55 @@ def find_ubuntu_package_url(package_names, ubuntu_release, arch):
             entry_arch = entry.get('Architecture')
             if entry_arch not in {arch, 'all'}:
                 continue
+            if package_version and entry.get('Version') != package_version:
+                continue
             filename = entry.get('Filename')
-            if filename:
-                return f"{repo_root}/{filename.lstrip('/')}"
+            if not filename:
+                continue
+            basename = os.path.basename(filename)
+            if package_filename and basename != package_filename:
+                continue
+            return f"{repo_root}/{filename.lstrip('/')}"
+    if exact_match_required:
+        return None
     return None
+
+def find_matching_ubuntu_libc_package_url(libc_path):
+    ubuntu_release = infer_ubuntu_release_from_libc(libc_path)
+    if not ubuntu_release:
+        log.warning("无法推断目标 Ubuntu 版本，无法回退到仓库索引下载 libc")
+        return None
+
+    arch = normalize_arch_name(get_elf_arch(libc_path))
+    if arch == 'unknown':
+        log.warning("无法识别 libc 架构，无法回退到仓库索引下载 libc")
+        return None
+
+    package_version = get_ubuntu_glibc_package_version(libc_path)
+    if not package_version:
+        log.warning("无法识别 libc 对应的 Ubuntu 包版本，无法回退到仓库索引下载 libc")
+        return None
+
+    package_filename = f'libc6_{package_version}_{arch}.deb'
+    package_url = find_ubuntu_package_url(
+        ['libc6'],
+        ubuntu_release,
+        arch,
+        package_version=package_version,
+        package_filename=package_filename,
+    )
+    if not package_url:
+        log.warning(
+            f"未在 Ubuntu 仓库索引中找到精确匹配的 libc 包: "
+            f"{stderr_name(package_filename)} (Ubuntu {stderr_version(ubuntu_release)})"
+        )
+        return None
+
+    log.info(
+        f"仓库索引命中 libc 包: {stderr_path(package_url)} "
+        f"(Ubuntu {stderr_version(ubuntu_release)}, 架构 {stderr_version(arch)})"
+    )
+    return package_url
 
 def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None):
     os.makedirs(target_dir, exist_ok=True)
@@ -912,6 +980,33 @@ def download_and_extract_deb_package(package_url, cache_key):
         log.warning(f"下载或解压额外依赖失败: {package_url} ({e})")
         return None
     return cache_dir
+
+def try_unstrip_libc_tree(libc_dir):
+    if not libcdb or not hasattr(libcdb, 'unstrip_libc'):
+        return None
+    candidates = []
+    for root, _dirs, files in os.walk(libc_dir):
+        for file_name in sorted(files):
+            if file_name == 'libc.so.6' or re.fullmatch(r'libc-\d+(?:\.\d+)*\.so', file_name):
+                candidates.append(os.path.join(root, file_name))
+    for candidate in candidates:
+        try:
+            if libcdb.unstrip_libc(candidate):
+                return candidate
+        except Exception as e:
+            log.debug(f"libc unstrip 失败: {candidate} ({e})")
+    return None
+
+def download_matching_ubuntu_libc_package(libc_path):
+    package_url = find_matching_ubuntu_libc_package_url(libc_path)
+    if not package_url:
+        return None
+    cache_key = hashlib.sha256(f'libc:{package_url}'.encode()).hexdigest()[:16]
+    extracted_dir = download_and_extract_deb_package(package_url, cache_key)
+    if not extracted_dir:
+        return None
+    try_unstrip_libc_tree(extracted_dir)
+    return extracted_dir
 
 def infer_download_context_from_libc(libc_path):
     ubuntu_release = infer_ubuntu_release_from_libc(libc_path)
@@ -1903,14 +1998,24 @@ def list_available_versions(index=None):
 
 def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_needed=None, package_hints=None, extra_packages=None):
     ensure_pwntools_cache_dir()
+    libc_dir = None
+    primary_error = None
     try:
         libc_dir = libcdb.download_libraries(libc_path)
     except Exception as e:
-        log.failure(f'libc 库下载失败: {e}')
-        return None
+        primary_error = e
+        log.warning(f'主下载链路失败，准备回退到 Ubuntu 仓库索引: {e}')
     if libc_dir is None or not os.path.exists(libc_dir):
-        log.failure('libc 库下载失败，请检查网络或 libc 文件有效性')
-        return None
+        fallback_dir = download_matching_ubuntu_libc_package(libc_path)
+        if fallback_dir:
+            libc_dir = fallback_dir
+            log.success(f'已通过 Ubuntu 仓库索引回退下载 libc: {stderr_path(libc_dir)}')
+        else:
+            if primary_error is not None:
+                log.failure(f'libc 库下载失败: {primary_error}')
+            else:
+                log.failure('libc 库下载失败，请检查网络、仓库镜像或 libc 文件有效性')
+            return None
     libc_dir = libc_dir.decode() if isinstance(libc_dir, bytes) else libc_dir
     target_dir = os.path.abspath(target_dir or (os.getcwd() + '/libc_dir'))
     os.makedirs(target_dir, exist_ok=True)
