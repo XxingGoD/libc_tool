@@ -10,7 +10,6 @@
 
 ## 依赖
 
-- Linux
 - Python 3
 - `pwntools`
 - `unix_ar`
