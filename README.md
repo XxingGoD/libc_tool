@@ -14,10 +14,8 @@
 - Python 3
 - `pwntools`
 - `unix_ar`
-- `zstandard`（有些 `.deb` 里的 `data.tar.zst` 会用到）
+- `zstandard`
 - `readelf`、`objdump`、`strings`
-- 能访问 `launchpad.net`、`archive.ubuntu.com`
-
 检查：
 ```bash
 python3 libc_tool.py --doctor
