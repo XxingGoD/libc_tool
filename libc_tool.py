@@ -3,11 +3,13 @@ import os
 import re
 import json
 import gzip
+import lzma
 import shutil
 import sys
 import hashlib
 import subprocess
 import tarfile
+import tempfile
 import socket
 import importlib.util
 import urllib.request
@@ -61,9 +63,10 @@ except Exception as e:
     ELF = None
     libcdb = None
 
+
 LIBC_DB_PATH = "/home/starlight/CtfTools/libc-database/db"
 LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 INDEX_BUILD_MAX_WORKERS = 8
 COMMON_LIBC_SYMBOLS = [
     '__libc_start_main',
@@ -91,6 +94,68 @@ UBUNTU_CODENAME_MAP = {
     "20.04": "focal", "20.10": "groovy", "21.04": "hirsute", "21.10": "impish",
     "22.04": "jammy", "22.10": "kinetic", "23.04": "lunar", "23.10": "mantic",
     "24.04": "noble", "24.10": "oracular", "25.04": "plucky", "25.10": "questing",
+}
+
+DEBIAN_GLIBC_MAP = {
+    "6": "2.11",
+    "7": "2.13",
+    "8": "2.19",
+    "9": "2.24",
+    "10": "2.28",
+    "11": "2.31",
+    "12": "2.36",
+    "13": "2.41",
+}
+
+DEBIAN_CODENAME_MAP = {
+    "6": "squeeze",
+    "7": "wheezy",
+    "8": "jessie",
+    "9": "stretch",
+    "10": "buster",
+    "11": "bullseye",
+    "12": "bookworm",
+    "13": "trixie",
+    "14": "forky",
+    "squeeze": "squeeze",
+    "wheezy": "wheezy",
+    "jessie": "jessie",
+    "stretch": "stretch",
+    "buster": "buster",
+    "bullseye": "bullseye",
+    "bookworm": "bookworm",
+    "trixie": "trixie",
+    "forky": "forky",
+    "sid": "sid",
+    "unstable": "sid",
+    "testing": "testing",
+}
+
+DEBIAN_CODENAME_SEARCH_ORDER = [
+    "trixie",
+    "bookworm",
+    "bullseye",
+    "buster",
+    "stretch",
+    "jessie",
+    "wheezy",
+    "squeeze",
+    "forky",
+    "sid",
+    "testing",
+]
+
+DEBIAN_GCC_RELEASE_MAP = {
+    "14.2.0": "13",
+    "12.2.0": "12",
+    "10.2.1": "11",
+    "10.2.0": "11",
+    "8.3.0": "10",
+    "6.3.0": "9",
+    "4.9.2": "8",
+    "4.8.4": "8",
+    "4.7.2": "7",
+    "4.4.7": "7",
 }
 
 SONAME_PACKAGE_HINTS = {
@@ -502,7 +567,7 @@ def append_doctor_check(checks, name, status, detail, required=True):
         'required': required,
     })
 
-def run_doctor(input_path=None, reference_elf=None, output_dir=None, extra_needed=None, package_hints=None, extra_packages=None):
+def run_doctor():
     checks = []
 
     append_doctor_check(
@@ -581,6 +646,9 @@ def run_doctor(input_path=None, reference_elf=None, output_dir=None, extra_neede
         ('network:archive_ubuntu', 'archive.ubuntu.com', 80, True),
         ('network:security_ubuntu', 'security.ubuntu.com', 80, False),
         ('network:old_releases_ubuntu', 'old-releases.ubuntu.com', 80, False),
+        ('network:debian', 'deb.debian.org', 443, False),
+        ('network:security_debian', 'security.debian.org', 443, False),
+        ('network:archive_debian', 'archive.debian.org', 443, False),
         ('network:libc_rip', 'libc.rip', 443, False),
     ):
         ok, detail = tcp_probe(host, port)
@@ -591,126 +659,6 @@ def run_doctor(input_path=None, reference_elf=None, output_dir=None, extra_neede
             detail,
             required=required,
         )
-
-    if input_path:
-        abs_input = os.path.abspath(input_path)
-        input_exists = os.path.exists(abs_input)
-        append_doctor_check(
-            checks,
-            'input_path',
-            'ok' if input_exists else 'error',
-            abs_input,
-        )
-        if input_exists:
-            file_kind = 'libc' if is_libc_family_name(abs_input) else ('elf' if is_elf_file(abs_input) else 'unknown')
-            append_doctor_check(
-                checks,
-                'input_kind',
-                'ok',
-                file_kind,
-                required=False,
-            )
-            if file_kind == 'libc':
-                ubuntu_release = infer_ubuntu_release_from_libc(abs_input)
-                append_doctor_check(
-                    checks,
-                    'libc_ubuntu_release',
-                    'ok' if ubuntu_release else 'warning',
-                    ubuntu_release or '无法推断',
-                    required=False,
-                )
-
-    resolved_elf = resolve_reference_elf_arg(input_path, reference_elf) if (input_path or reference_elf) else None
-    extra_needed = normalize_soname_list(extra_needed)
-    extra_packages = normalize_package_name_list(extra_packages)
-    if extra_needed:
-        append_doctor_check(
-            checks,
-            'extra_needed',
-            'ok',
-            ', '.join(extra_needed),
-            required=False,
-        )
-    if extra_packages:
-        append_doctor_check(
-            checks,
-            'extra_packages',
-            'ok',
-            ', '.join(extra_packages),
-            required=False,
-        )
-    if package_hints:
-        hint_lines = [
-            f"{soname}={','.join(packages)}"
-            for soname, packages in sorted(package_hints.items())
-        ]
-        append_doctor_check(
-            checks,
-            'package_hints',
-            'ok',
-            '; '.join(hint_lines),
-            required=False,
-        )
-    if reference_elf:
-        abs_ref = os.path.abspath(reference_elf)
-        ref_exists = os.path.exists(abs_ref)
-        append_doctor_check(
-            checks,
-            'reference_elf_arg',
-            'ok' if ref_exists else 'error',
-            abs_ref,
-        )
-        if ref_exists and not is_elf_file(abs_ref):
-            append_doctor_check(
-                checks,
-                'reference_elf_valid',
-                'error',
-                f'不是有效 ELF: {abs_ref}',
-            )
-    if resolved_elf:
-        append_doctor_check(
-            checks,
-            'reference_elf',
-            'ok',
-            resolved_elf,
-            required=False,
-        )
-        needed = get_needed_shared_libraries(resolved_elf)
-        append_doctor_check(
-            checks,
-            'reference_elf_needed',
-            'ok' if needed else 'warning',
-            ', '.join(needed) if needed else '未解析到 NEEDED 项',
-            required=False,
-        )
-    elif input_path and is_libc_family_name(input_path) and not extra_needed and not extra_packages:
-        append_doctor_check(
-            checks,
-            'reference_elf',
-            'warning',
-            '未自动关联到目标 ELF，建议使用 --elf',
-            required=False,
-        )
-
-    if input_path or resolved_elf or output_dir:
-        target_dir = os.path.abspath(output_dir) if output_dir else get_download_target_dir(input_path, resolved_elf)
-        parent_dir = find_nearest_existing_parent(target_dir)
-        writable = bool(parent_dir and os.access(parent_dir, os.W_OK))
-        append_doctor_check(
-            checks,
-            'output_dir',
-            'ok' if writable else 'error',
-            f"{target_dir} (parent={parent_dir or '-'})",
-        )
-        if resolved_elf or extra_needed:
-            missing = get_missing_needed_libraries(resolved_elf, target_dir, extra_needed=extra_needed)
-            append_doctor_check(
-                checks,
-                'needed_missing_in_output',
-                'warning' if missing else 'ok',
-                ', '.join(missing) if missing else '无',
-                required=False,
-            )
 
     has_error = any(item['status'] == 'error' and item['required'] for item in checks)
     return {
@@ -748,6 +696,19 @@ def get_ubuntu_glibc_package_version(libc_path):
         return match.group(1)
     return None
 
+def get_debian_glibc_package_version(libc_path):
+    try:
+        strings_output = subprocess.check_output(
+            ['strings', libc_path],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors='ignore')
+    except Exception:
+        return None
+    match = re.search(r"GNU C Library \(Debian GLIBC ([^)]+)\)", strings_output)
+    if match:
+        return match.group(1)
+    return None
+
 def infer_ubuntu_release_from_libc(libc_path):
     pkg_ver = get_ubuntu_glibc_package_version(libc_path)
     if pkg_ver:
@@ -767,12 +728,45 @@ def infer_ubuntu_release_from_libc(libc_path):
                     return ubuntu_ver
     return None
 
+def infer_debian_release_from_libc(libc_path):
+    pkg_ver = get_debian_glibc_package_version(libc_path)
+    if pkg_ver:
+        debian_suffix_match = re.search(r'\+deb(\d+)u\d+', pkg_ver)
+        if debian_suffix_match:
+            return debian_suffix_match.group(1)
+        glibc_ver = pkg_ver.split('-', 1)[0]
+        for debian_release, mapped_glibc in DEBIAN_GLIBC_MAP.items():
+            if debian_release.isdigit() and mapped_glibc == glibc_ver:
+                return debian_release
+    versions = get_glibc_version_from_elf(libc_path)
+    for ver in versions:
+        if ver.startswith('debian_') and 'inferred' not in ver:
+            return ver.replace('debian_', '')
+    for ver in versions:
+        if ver.startswith('likely_glibc_'):
+            target_glibc = ver.replace('likely_glibc_', '')
+            for debian_release, mapped_glibc in DEBIAN_GLIBC_MAP.items():
+                if mapped_glibc == target_glibc:
+                    return debian_release
+    return None
+
+def normalize_debian_release(release):
+    if not release:
+        return None
+    return DEBIAN_CODENAME_MAP.get(str(release).strip().lower())
+
 def ensure_ubuntu_repo_root(base_url):
     repo_root = (base_url or '').rstrip('/')
     if not repo_root:
         return None
     if not repo_root.endswith('/ubuntu'):
         repo_root += '/ubuntu'
+    return repo_root
+
+def ensure_debian_repo_root(base_url):
+    repo_root = (base_url or '').rstrip('/')
+    if not repo_root:
+        return None
     return repo_root
 
 def iter_ubuntu_package_indexes(ubuntu_release, arch):
@@ -811,6 +805,126 @@ def iter_ubuntu_package_indexes(ubuntu_release, arch):
                 index_url,
             )
 
+def iter_debian_package_indexes(debian_release, arch):
+    requested_codename = normalize_debian_release(debian_release)
+    current_base = ensure_debian_repo_root(
+        os.environ.get('PWN_DEBIAN_ARCHIVE_URL', 'https://deb.debian.org/debian')
+    )
+    security_base = ensure_debian_repo_root(
+        os.environ.get('PWN_DEBIAN_SECURITY_URL', 'https://security.debian.org/debian-security')
+    )
+    archive_base = ensure_debian_repo_root(
+        os.environ.get('PWN_DEBIAN_OLD_RELEASES_URL', 'https://archive.debian.org/debian')
+    )
+    archive_security_base = ensure_debian_repo_root(
+        os.environ.get('PWN_DEBIAN_OLD_SECURITY_URL', 'https://archive.debian.org/debian-security')
+    )
+
+    codenames = []
+    if requested_codename:
+        codenames.append(requested_codename)
+    elif debian_release:
+        codenames.append(str(debian_release).strip())
+    codenames.extend(DEBIAN_CODENAME_SEARCH_ORDER)
+
+    seen_codenames = set()
+    ordered_codenames = []
+    for codename in codenames:
+        if not codename or codename in seen_codenames:
+            continue
+        seen_codenames.add(codename)
+        ordered_codenames.append(codename)
+
+    components = ['main']
+    seen = set()
+    for codename in ordered_codenames:
+        suite_roots = [
+            (codename, current_base),
+            (f'{codename}-updates', current_base),
+            (f'{codename}-security', security_base),
+            (codename, archive_base),
+            (f'{codename}-updates', archive_base),
+            (f'{codename}/updates', archive_security_base),
+            (f'{codename}-security', archive_security_base),
+        ]
+        for suite, repo_root in suite_roots:
+            if not repo_root:
+                continue
+            for component in components:
+                for suffix in ('.gz', '.xz'):
+                    index_url = f'{repo_root}/dists/{suite}/{component}/binary-{arch}/Packages{suffix}'
+                    if index_url in seen:
+                        continue
+                    seen.add(index_url)
+                    yield repo_root, index_url
+
+def iter_ubuntu_debug_package_indexes(ubuntu_release, arch):
+    codename = UBUNTU_CODENAME_MAP.get(ubuntu_release)
+    if not codename:
+        return
+    ddebs_base = ensure_debian_repo_root(
+        os.environ.get('PWN_UBUNTU_DDEBS_URL', 'http://ddebs.ubuntu.com')
+    )
+    pockets = [
+        codename,
+        f'{codename}-updates',
+        f'{codename}-security',
+        f'{codename}-proposed',
+    ]
+    components = ['main', 'universe', 'multiverse', 'restricted']
+    seen = set()
+    for pocket in pockets:
+        for component in components:
+            for suffix in ('.gz', '.xz'):
+                index_url = f'{ddebs_base}/dists/{pocket}/{component}/binary-{arch}/Packages{suffix}'
+                if index_url in seen:
+                    continue
+                seen.add(index_url)
+                yield ddebs_base, index_url
+
+def iter_debian_debug_package_indexes(debian_release, arch):
+    requested_codename = normalize_debian_release(debian_release)
+    debug_base = ensure_debian_repo_root(
+        os.environ.get('PWN_DEBIAN_DEBUG_URL', 'https://deb.debian.org/debian-debug')
+    )
+    archive_debug_base = ensure_debian_repo_root(
+        os.environ.get('PWN_DEBIAN_OLD_DEBUG_URL', 'https://archive.debian.org/debian-debug')
+    )
+    codenames = []
+    if requested_codename:
+        codenames.append(requested_codename)
+    elif debian_release:
+        codenames.append(str(debian_release).strip())
+    if not codenames:
+        codenames.extend(DEBIAN_CODENAME_SEARCH_ORDER)
+
+    seen_codenames = set()
+    ordered_codenames = []
+    for codename in codenames:
+        if not codename or codename in seen_codenames:
+            continue
+        seen_codenames.add(codename)
+        ordered_codenames.append(codename)
+
+    seen = set()
+    for codename in ordered_codenames:
+        suites = [
+            f'{codename}-debug',
+            f'{codename}-updates-debug',
+            f'{codename}-security-debug',
+            f'{codename}-proposed-updates-debug',
+        ]
+        for repo_root in (debug_base, archive_debug_base):
+            if not repo_root:
+                continue
+            for suite in suites:
+                for suffix in ('.xz', '.gz'):
+                    index_url = f'{repo_root}/dists/{suite}/main/binary-{arch}/Packages{suffix}'
+                    if index_url in seen:
+                        continue
+                    seen.add(index_url)
+                    yield repo_root, index_url
+
 def iter_debian_control_entries(text):
     entry = {}
     current_key = None
@@ -832,19 +946,33 @@ def iter_debian_control_entries(text):
     if entry:
         yield entry
 
-def find_ubuntu_package_url(package_names, ubuntu_release, arch, package_version=None, package_filename=None):
-    if not package_names or not ubuntu_release or not arch:
+def decode_debian_package_index(raw_data, index_url):
+    if index_url.endswith('.gz'):
+        return gzip.decompress(raw_data).decode(errors='ignore')
+    if index_url.endswith('.xz'):
+        return lzma.decompress(raw_data).decode(errors='ignore')
+    return raw_data.decode(errors='ignore')
+
+def find_deb_package_url(package_names, distro, release, arch, package_version=None, package_filename=None):
+    if not package_names or not distro or not arch:
         return None
     wanted = set(package_names)
     exact_match_required = bool(package_version or package_filename)
-    for repo_root, index_url in iter_ubuntu_package_indexes(ubuntu_release, arch):
+    distro_label = 'Ubuntu' if distro == 'ubuntu' else 'Debian'
+    if distro == 'ubuntu':
+        index_iter = iter_ubuntu_package_indexes(release, arch)
+    elif distro == 'debian':
+        index_iter = iter_debian_package_indexes(release, arch)
+    else:
+        return None
+    for repo_root, index_url in index_iter:
         try:
             raw_data = libcdb.wget(index_url, timeout=20)
             if not raw_data:
                 continue
-            index_text = gzip.decompress(raw_data).decode(errors='ignore')
+            index_text = decode_debian_package_index(raw_data, index_url)
         except Exception as e:
-            log.warning(f"获取 Ubuntu 包索引失败: {index_url} ({e})")
+            log.warning(f"获取 {distro_label} 包索引失败: {index_url} ({e})")
             continue
         for entry in iter_debian_control_entries(index_text):
             if entry.get('Package') not in wanted:
@@ -865,13 +993,69 @@ def find_ubuntu_package_url(package_names, ubuntu_release, arch, package_version
         return None
     return None
 
+def find_deb_debug_package_url(package_names, distro, release, arch, package_version=None, package_filename=None):
+    if not package_names or not distro or not arch:
+        return None
+    wanted = set(package_names)
+    distro_label = 'Ubuntu' if distro == 'ubuntu' else 'Debian'
+    if distro == 'ubuntu':
+        index_iter = iter_ubuntu_debug_package_indexes(release, arch)
+    elif distro == 'debian':
+        index_iter = iter_debian_debug_package_indexes(release, arch)
+    else:
+        return None
+    for repo_root, index_url in index_iter:
+        try:
+            raw_data = libcdb.wget(index_url, timeout=20)
+            if not raw_data:
+                continue
+            index_text = decode_debian_package_index(raw_data, index_url)
+        except Exception as e:
+            log.warning(f"获取 {distro_label} debug 包索引失败: {index_url} ({e})")
+            continue
+        for entry in iter_debian_control_entries(index_text):
+            if entry.get('Package') not in wanted:
+                continue
+            entry_arch = entry.get('Architecture')
+            if entry_arch not in {arch, 'all'}:
+                continue
+            if package_version and entry.get('Version') != package_version:
+                continue
+            filename = entry.get('Filename')
+            if not filename:
+                continue
+            basename = os.path.basename(filename)
+            if package_filename and basename != package_filename:
+                continue
+            return f"{repo_root}/{filename.lstrip('/')}"
+    return None
+
+def find_ubuntu_package_url(package_names, ubuntu_release, arch, package_version=None, package_filename=None):
+    return find_deb_package_url(
+        package_names,
+        'ubuntu',
+        ubuntu_release,
+        normalize_deb_arch_name(arch),
+        package_version=package_version,
+        package_filename=package_filename,
+    )
+
+def find_debian_package_url(package_names, debian_release, arch, package_version=None, package_filename=None):
+    return find_deb_package_url(
+        package_names,
+        'debian',
+        debian_release,
+        normalize_deb_arch_name(arch),
+        package_version=package_version,
+        package_filename=package_filename,
+    )
+
 def find_matching_ubuntu_libc_package_url(libc_path):
     ubuntu_release = infer_ubuntu_release_from_libc(libc_path)
     if not ubuntu_release:
-        log.warning("无法推断目标 Ubuntu 版本，无法回退到仓库索引下载 libc")
         return None
 
-    arch = normalize_arch_name(get_elf_arch(libc_path))
+    arch = normalize_deb_arch_name(get_elf_arch(libc_path))
     if arch == 'unknown':
         log.warning("无法识别 libc 架构，无法回退到仓库索引下载 libc")
         return None
@@ -902,7 +1086,128 @@ def find_matching_ubuntu_libc_package_url(libc_path):
     )
     return package_url
 
-def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None):
+def find_matching_debian_libc_package_url(libc_path):
+    if not get_debian_glibc_package_version(libc_path):
+        return None
+    debian_release = infer_debian_release_from_libc(libc_path)
+    arch = normalize_deb_arch_name(get_elf_arch(libc_path))
+    if arch == 'unknown':
+        log.warning("无法识别 libc 架构，无法回退到 Debian 仓库索引下载 libc")
+        return None
+
+    package_version = get_debian_glibc_package_version(libc_path)
+    if not package_version:
+        log.warning("无法识别 libc 对应的 Debian 包版本，无法回退到 Debian 仓库索引下载 libc")
+        return None
+
+    package_filename = f'libc6_{package_version}_{arch}.deb'
+    package_url = find_debian_package_url(
+        ['libc6'],
+        debian_release,
+        arch,
+        package_version=package_version,
+        package_filename=package_filename,
+    )
+    if not package_url:
+        release_text = f"Debian {debian_release}" if debian_release else "Debian 仓库"
+        log.warning(
+            f"未在 Debian 仓库索引中找到精确匹配的 libc 包: "
+            f"{stderr_name(package_filename)} ({stderr_version(release_text)})"
+        )
+        return None
+
+    log.info(
+        f"仓库索引命中 libc 包: {stderr_path(package_url)} "
+        f"(Debian {stderr_version(debian_release or 'auto')}, 架构 {stderr_version(arch)})"
+    )
+    return package_url
+
+def parse_deb_package_filename(package_url):
+    basename = os.path.basename(package_url or '')
+    match = re.match(r'(?P<name>[A-Za-z0-9.+-]+)_(?P<version>.+)_(?P<arch>[A-Za-z0-9]+)\.d(?:d)?eb$', basename)
+    if not match:
+        return None
+    return match.groupdict()
+
+def derive_ubuntu_debug_package_urls(package_url):
+    info = parse_deb_package_filename(package_url)
+    if not info:
+        return []
+    version = info['version']
+    arch = info['arch']
+    base_dir = package_url.rsplit('/', 1)[0] if '/' in package_url else ''
+    candidates = []
+    if base_dir:
+        candidates.extend([
+            f'{base_dir}/libc6-dbg_{version}_{arch}.deb',
+            f'{base_dir}/libc6-dbgsym_{version}_{arch}.ddeb',
+            f'{base_dir}/libc6-dbgsym_{version}_{arch}.deb',
+        ])
+    candidates.extend([
+        f'https://launchpad.net/ubuntu/+archive/primary/+files/libc6-dbg_{version}_{arch}.deb',
+        f'https://launchpad.net/ubuntu/+archive/primary/+files/libc6-dbgsym_{version}_{arch}.ddeb',
+        f'http://ddebs.ubuntu.com/pool/main/g/glibc/libc6-dbgsym_{version}_{arch}.ddeb',
+        f'http://ddebs.ubuntu.com/pool/main/e/eglibc/libc6-dbg_{version}_{arch}.deb',
+    ])
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        normalized = re.sub(r'(?<!:)//+', '/', candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+def iter_matching_debug_package_urls(package_url, distro=None, release=None):
+    info = parse_deb_package_filename(package_url)
+    if not info:
+        return
+    version = info['version']
+    arch = info['arch']
+    if distro == 'ubuntu' or 'ubuntu' in version:
+        for candidate_url in derive_ubuntu_debug_package_urls(package_url):
+            yield candidate_url
+    if distro == 'debian' or '+deb' in version:
+        debian_release = release
+        deb_match = re.search(r'\+deb(\d+)u\d+', version)
+        if deb_match:
+            debian_release = deb_match.group(1)
+        debug_url = find_deb_debug_package_url(
+            ['libc6-dbg', 'libc6-dbgsym'],
+            'debian',
+            debian_release,
+            arch,
+            package_version=version,
+        )
+        if debug_url:
+            yield debug_url
+
+def find_matching_debug_package_url(package_url, distro=None, release=None):
+    return next(iter_matching_debug_package_urls(package_url, distro=distro, release=release), None)
+
+def find_local_libc_database_url(libc_path):
+    abs_path = os.path.abspath(libc_path)
+    db_path = os.path.abspath(LIBC_DB_PATH)
+    try:
+        in_db = os.path.commonpath([abs_path, db_path]) == db_path
+    except ValueError:
+        in_db = False
+    if not in_db:
+        return None
+    url_path = os.path.splitext(abs_path)[0] + '.url'
+    if not os.path.exists(url_path):
+        return None
+    try:
+        with open(url_path, 'r') as f:
+            package_url = f.read().strip()
+    except OSError:
+        return None
+    if not package_url:
+        return None
+    return re.sub(r'(?<!:)//+', '/', package_url)
+
+def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None, overwrite=False):
     os.makedirs(target_dir, exist_ok=True)
     copied = []
     seen = set()
@@ -922,7 +1227,7 @@ def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None):
             target_file = os.path.join(target_dir, file_name)
             if target_file in seen:
                 continue
-            if os.path.exists(target_file):
+            if os.path.exists(target_file) and not overwrite:
                 seen.add(target_file)
                 continue
             shutil.copy2(source_file, target_file)
@@ -981,15 +1286,151 @@ def download_and_extract_deb_package(package_url, cache_key):
         return None
     return cache_dir
 
+def elf_has_debug_symbols(elf_path):
+    try:
+        result = subprocess.run(
+            ['readelf', '-S', elf_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=readelf_env(),
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return any(name in result.stdout for name in ('.debug_info', '.symtab'))
+
+def find_libc_files_in_tree(root_dir):
+    candidates = []
+    for root, _dirs, files in os.walk(root_dir):
+        for file_name in sorted(files):
+            if file_name == 'libc.so.6' or re.fullmatch(r'libc-\d+(?:\.\d+)*\.so', file_name):
+                candidate = os.path.join(root, file_name)
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+    return candidates
+
+def find_debug_files_in_tree(root_dir):
+    candidates = []
+    for root, _dirs, files in os.walk(root_dir):
+        for file_name in sorted(files):
+            candidate = os.path.join(root, file_name)
+            if not os.path.isfile(candidate):
+                continue
+            if file_name.endswith('.debug') or is_elf_file(candidate):
+                candidates.append(candidate)
+    return candidates
+
+def eu_unstrip_with_debug(libc_file, debug_file):
+    if not shutil.which('eu-unstrip'):
+        log.warning('找不到 eu-unstrip，无法合并 debug 符号；请安装 elfutils')
+        return False
+    tmp_path = None
+    try:
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=os.path.basename(libc_file) + '.unstrip.',
+                suffix='.so',
+                dir=os.path.dirname(libc_file),
+            )
+            os.close(fd)
+            result = subprocess.run(
+                ['eu-unstrip', '-o', tmp_path, libc_file, debug_file],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=readelf_env(),
+            )
+        except Exception as e:
+            log.debug(f"eu-unstrip 执行失败: {e}")
+            return False
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or '').strip()
+            log.debug(f"eu-unstrip 合并失败: {libc_file} + {debug_file} ({detail})")
+            return False
+        if not elf_has_debug_symbols(tmp_path):
+            return False
+        shutil.copystat(libc_file, tmp_path)
+        os.replace(tmp_path, libc_file)
+        tmp_path = None
+        return True
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+def unstrip_libc_tree_with_debug_package(libc_dir, debug_dir):
+    for debug_libc in find_libc_files_in_tree(debug_dir):
+        if elf_has_debug_symbols(debug_libc):
+            for target_libc in find_libc_files_in_tree(libc_dir):
+                if os.path.basename(target_libc) == os.path.basename(debug_libc) or os.path.basename(target_libc) == 'libc.so.6':
+                    shutil.copy2(debug_libc, target_libc)
+                    log.success(
+                        f"debug 包提供完整未 strip libc: {stderr_path(target_libc)} "
+                        f"<- {stderr_path(debug_libc)}"
+                    )
+                    return True
+    debug_files = find_debug_files_in_tree(debug_dir)
+    if not debug_files:
+        log.warning("debug 包中未找到可用 debug 文件")
+        return False
+    for libc_file in find_libc_files_in_tree(libc_dir):
+        if elf_has_debug_symbols(libc_file):
+            return True
+        for debug_file in debug_files:
+            if eu_unstrip_with_debug(libc_file, debug_file):
+                log.success(
+                    f"已合并 debug 符号: {stderr_path(libc_file)} "
+                    f"<- {stderr_path(debug_file)}"
+                )
+                return True
+    return False
+
+def fetch_debug_package_for_libc_package(package_url, cache_key, distro=None, release=None):
+    attempted_url = None
+    attempted_urls = []
+    for debug_url in iter_matching_debug_package_urls(package_url, distro=distro, release=release):
+        attempted_url = debug_url
+        attempted_urls.append(debug_url)
+        log.info(f"尝试下载 debug 包: {stderr_path(debug_url)}")
+        debug_cache_key = hashlib.sha256(f'debug:{debug_url}'.encode()).hexdigest()[:16]
+        debug_dir = download_and_extract_deb_package(debug_url, f'{cache_key}-dbg-{debug_cache_key}')
+        if debug_dir:
+            return debug_url, debug_dir
+    if attempted_urls:
+        log.warning(
+            "debug 包候选均失败: " +
+            ", ".join(stderr_path(url) for url in attempted_urls)
+        )
+    return attempted_url, None
+
+def download_and_extract_libc_package_with_debug(package_url, cache_key, distro=None, release=None):
+    extracted_dir = download_and_extract_deb_package(package_url, cache_key)
+    if not extracted_dir:
+        return None
+    if any(elf_has_debug_symbols(path) for path in find_libc_files_in_tree(extracted_dir)):
+        return extracted_dir
+    debug_url, debug_dir = fetch_debug_package_for_libc_package(
+        package_url,
+        cache_key,
+        distro=distro,
+        release=release,
+    )
+    if debug_dir and unstrip_libc_tree_with_debug_package(extracted_dir, debug_dir):
+        return extracted_dir
+    if debug_url:
+        log.warning(f"已下载 libc 包，但未能获取或合并未 strip 符号: {stderr_path(debug_url)}")
+    else:
+        log.warning("已下载 libc 包，但未找到对应 debug 包")
+    return extracted_dir
+
 def try_unstrip_libc_tree(libc_dir):
     if not libcdb or not hasattr(libcdb, 'unstrip_libc'):
         return None
-    candidates = []
-    for root, _dirs, files in os.walk(libc_dir):
-        for file_name in sorted(files):
-            if file_name == 'libc.so.6' or re.fullmatch(r'libc-\d+(?:\.\d+)*\.so', file_name):
-                candidates.append(os.path.join(root, file_name))
-    for candidate in candidates:
+    for candidate in find_libc_files_in_tree(libc_dir):
         try:
             if libcdb.unstrip_libc(candidate):
                 return candidate
@@ -1002,39 +1443,173 @@ def download_matching_ubuntu_libc_package(libc_path):
     if not package_url:
         return None
     cache_key = hashlib.sha256(f'libc:{package_url}'.encode()).hexdigest()[:16]
-    extracted_dir = download_and_extract_deb_package(package_url, cache_key)
+    extracted_dir = download_and_extract_libc_package_with_debug(
+        package_url,
+        cache_key,
+        distro='ubuntu',
+        release=infer_ubuntu_release_from_libc(libc_path),
+    )
     if not extracted_dir:
         return None
     try_unstrip_libc_tree(extracted_dir)
     return extracted_dir
 
+def download_matching_debian_libc_package(libc_path):
+    package_url = find_matching_debian_libc_package_url(libc_path)
+    if not package_url:
+        return None
+    cache_key = hashlib.sha256(f'libc:{package_url}'.encode()).hexdigest()[:16]
+    extracted_dir = download_and_extract_libc_package_with_debug(
+        package_url,
+        cache_key,
+        distro='debian',
+        release=infer_debian_release_from_libc(libc_path),
+    )
+    if not extracted_dir:
+        return None
+    try_unstrip_libc_tree(extracted_dir)
+    return extracted_dir
+
+def download_local_libc_database_package(libc_path):
+    package_url = find_local_libc_database_url(libc_path)
+    if not package_url:
+        return None
+    cache_key = hashlib.sha256(f'local-url:{package_url}'.encode()).hexdigest()[:16]
+    distro = 'debian' if '+deb' in package_url else ('ubuntu' if 'ubuntu' in package_url else None)
+    extracted_dir = download_and_extract_libc_package_with_debug(
+        package_url,
+        cache_key,
+        distro=distro,
+        release=infer_debian_release_from_libc(libc_path) if distro == 'debian' else infer_ubuntu_release_from_libc(libc_path),
+    )
+    if not extracted_dir:
+        return None
+    try_unstrip_libc_tree(extracted_dir)
+    log.success(f'已通过本地 libc-database URL 下载 libc: {stderr_path(extracted_dir)}')
+    return extracted_dir
+
+def try_unstrip_cached_libc_dir_from_local_url(libc_path, libc_dir):
+    if find_unstripped_libc_in_dir(libc_dir):
+        return libc_dir
+    package_url = find_local_libc_database_url(libc_path)
+    if not package_url:
+        return None
+    distro = 'debian' if '+deb' in package_url else ('ubuntu' if 'ubuntu' in package_url else None)
+    cache_key = hashlib.sha256(f'cached-local-url:{package_url}'.encode()).hexdigest()[:16]
+    log.info(f"缓存 libc 未带符号，尝试通过本地 URL 补 debug 包: {stderr_path(package_url)}")
+    debug_url, debug_dir = fetch_debug_package_for_libc_package(
+        package_url,
+        cache_key,
+        distro=distro,
+        release=infer_debian_release_from_libc(libc_path) if distro == 'debian' else infer_ubuntu_release_from_libc(libc_path),
+    )
+    if debug_dir and unstrip_libc_tree_with_debug_package(libc_dir, debug_dir):
+        return libc_dir
+    if debug_url:
+        log.warning(f"缓存 libc debug 合并失败: {stderr_path(debug_url)}")
+
+    refreshed_dir = download_and_extract_libc_package_with_debug(
+        package_url,
+        cache_key,
+        distro=distro,
+        release=infer_debian_release_from_libc(libc_path) if distro == 'debian' else infer_ubuntu_release_from_libc(libc_path),
+    )
+    if refreshed_dir and find_unstripped_libc_in_dir(refreshed_dir):
+        return refreshed_dir
+    return None
+
+def download_matching_deb_libc_package(libc_path):
+    extracted_dir = download_local_libc_database_package(libc_path)
+    if extracted_dir:
+        return extracted_dir
+
+    candidates = []
+    if get_ubuntu_glibc_package_version(libc_path):
+        candidates.append(('Ubuntu', download_matching_ubuntu_libc_package))
+    if get_debian_glibc_package_version(libc_path):
+        candidates.append(('Debian', download_matching_debian_libc_package))
+    if not candidates:
+        candidates = [
+            ('Ubuntu', download_matching_ubuntu_libc_package),
+            ('Debian', download_matching_debian_libc_package),
+        ]
+
+    for distro, downloader in candidates:
+        extracted_dir = downloader(libc_path)
+        if extracted_dir:
+            log.success(f'已通过 {distro} 仓库索引回退下载 libc: {stderr_path(extracted_dir)}')
+            return extracted_dir
+    if not find_local_libc_database_url(libc_path):
+        log.warning("无法通过本地 URL 或 Ubuntu/Debian 仓库索引回退下载 libc")
+    return None
+
+def find_unstripped_libc_in_dir(target_dir):
+    for libc_file in sorted(find_libc_files_in_tree(target_dir)):
+        if elf_has_debug_symbols(libc_file):
+            return libc_file
+    return None
+
+def find_repository_package_url(package_names, distro, release, arch, package_version=None, package_filename=None):
+    if distro == 'ubuntu':
+        return find_ubuntu_package_url(
+            package_names,
+            release,
+            arch,
+            package_version=package_version,
+            package_filename=package_filename,
+        )
+    if distro == 'debian':
+        return find_debian_package_url(
+            package_names,
+            release,
+            arch,
+            package_version=package_version,
+            package_filename=package_filename,
+        )
+    return None
+
+def format_download_context(distro, release, arch):
+    label = 'Ubuntu' if distro == 'ubuntu' else 'Debian'
+    release_text = release or 'auto'
+    return f"{label} {release_text}, 架构 {arch}"
+
 def infer_download_context_from_libc(libc_path):
-    ubuntu_release = infer_ubuntu_release_from_libc(libc_path)
-    if not ubuntu_release:
-        log.warning("无法推断目标 Ubuntu 版本，跳过额外依赖补全")
-        return None, None
-    arch = normalize_arch_name(get_elf_arch(libc_path))
+    arch = normalize_deb_arch_name(get_elf_arch(libc_path))
     if arch == 'unknown':
         log.warning("无法识别 libc 架构，跳过额外依赖补全")
-        return None, None
-    return ubuntu_release, arch
+        return None
+    if get_ubuntu_glibc_package_version(libc_path):
+        ubuntu_release = infer_ubuntu_release_from_libc(libc_path)
+        return 'ubuntu', ubuntu_release, arch
+    if get_debian_glibc_package_version(libc_path):
+        debian_release = infer_debian_release_from_libc(libc_path)
+        return 'debian', debian_release, arch
+    ubuntu_release = infer_ubuntu_release_from_libc(libc_path)
+    debian_release = infer_debian_release_from_libc(libc_path)
+    if ubuntu_release:
+        return 'ubuntu', ubuntu_release, arch
+    if debian_release:
+        return 'debian', debian_release, arch
+    log.warning("无法推断目标 Ubuntu/Debian 版本，跳过额外依赖补全")
+    return None
 
 def download_extra_packages(libc_path, target_dir, extra_packages=None):
     packages = normalize_package_name_list(extra_packages)
     if not packages:
         return []
 
-    ubuntu_release, arch = infer_download_context_from_libc(libc_path)
-    if not ubuntu_release or not arch:
+    download_context = infer_download_context_from_libc(libc_path)
+    if not download_context:
         return []
+    distro, release, arch = download_context
 
     copied = []
     log.info(
-        f"检查额外包: 目标 Ubuntu {stderr_version(ubuntu_release)}, "
-        f"架构 {stderr_version(arch)}, 指定 {stderr_number(len(packages))} 个"
+        f"检查额外包: 目标 {stderr_version(format_download_context(distro, release, arch))}, "
+        f"指定 {stderr_number(len(packages))} 个"
     )
     for package_name in packages:
-        package_url = find_ubuntu_package_url([package_name], ubuntu_release, arch)
+        package_url = find_repository_package_url([package_name], distro, release, arch)
         if not package_url:
             log.warning(f"未找到额外包 {stderr_name(package_name)}")
             continue
@@ -1058,23 +1633,24 @@ def download_missing_dependencies(libc_path, elf_path, target_dir, missing=None,
     if not missing:
         return []
 
-    ubuntu_release, arch = infer_download_context_from_libc(libc_path)
-    if not ubuntu_release or not arch:
+    download_context = infer_download_context_from_libc(libc_path)
+    if not download_context:
         return []
+    distro, release, arch = download_context
 
     copied = []
     log.info(
-        f"检查额外依赖: 目标 Ubuntu {stderr_version(ubuntu_release)}, "
-        f"架构 {stderr_version(arch)}, 缺失 {stderr_number(len(missing))} 个"
+        f"检查额外依赖: 目标 {stderr_version(format_download_context(distro, release, arch))}, "
+        f"缺失 {stderr_number(len(missing))} 个"
     )
     for soname in missing:
         package_names = guess_package_names_from_soname_with_hints(soname, package_hints=package_hints)
         if not package_names:
-            log.warning(f"无法推断 {stderr_name(soname)} 对应的 Ubuntu 包")
+            log.warning(f"无法推断 {stderr_name(soname)} 对应的 Debian/Ubuntu 包")
             continue
-        package_url = find_ubuntu_package_url(package_names, ubuntu_release, arch)
+        package_url = find_repository_package_url(package_names, distro, release, arch)
         if not package_url:
-            log.warning(f"未找到 {stderr_name(soname)} 的 Ubuntu 包（候选: {', '.join(package_names)}）")
+            log.warning(f"未找到 {stderr_name(soname)} 的 Debian/Ubuntu 包（候选: {', '.join(package_names)}）")
             continue
         cache_key = hashlib.sha256(package_url.encode()).hexdigest()[:16]
         extracted_dir = download_and_extract_deb_package(package_url, cache_key)
@@ -1177,6 +1753,12 @@ def normalize_arch_name(arch):
     if arch in ('amd64', 'x86_64'):
         return 'amd64'
     return arch or 'unknown'
+
+def normalize_deb_arch_name(arch):
+    arch = normalize_arch_name(arch)
+    if arch == 'aarch64':
+        return 'arm64'
+    return arch
 
 def parse_arch_from_readelf_output(output):
     class_match = re.search(r'Class:\s+(ELF32|ELF64)', output)
@@ -1339,11 +1921,13 @@ def build_index_cache(db_path=LIBC_DB_PATH, cache_path=LIBC_INDEX_CACHE, emit=No
     emit(f"  Versions: {stdout_number(len(index['by_version']))}")
     emit(f"  Symbol indices: {stdout_number(sum(len(v) for v in index['by_symbol_suffix'].values()))}")
 
-    with open(cache_path, 'w') as f:
-        json.dump(index, f)
-
-    emit("")
-    emit(f"{stdout_ok('Cache saved to:')} {stdout_path(cache_path)}")
+    try:
+        with open(cache_path, 'w') as f:
+            json.dump(index, f)
+        emit("")
+        emit(f"{stdout_ok('Cache saved to:')} {stdout_path(cache_path)}")
+    except OSError as e:
+        log.warning(f"索引缓存写入失败，将使用内存索引继续: {e}")
     return index
 
 def rebuild_index_cache(force=False, quiet=False):
@@ -1399,6 +1983,18 @@ def symbol_count(entry):
 def extract_release_tag(name):
     match = re.search(r'_(\d+\.\d+(?:\.\d+)?)-([^_]+)', name)
     return match.group(2) if match else ""
+
+def preferred_arch_package_score(name, target_arch):
+    if target_arch == 'unknown':
+        return 0
+    stem = name[:-3] if name.endswith('.so') else name
+    if re.match(rf'^libc6_\d.*_{re.escape(target_arch)}(?:_\d+)?$', stem):
+        return 3
+    if re.match(rf'^libc6-{re.escape(target_arch)}_\d.*_', stem):
+        return 2
+    if stem.endswith(f'_{target_arch}') or re.search(rf'_{re.escape(target_arch)}_\d+$', stem):
+        return 1
+    return 0
 
 def natural_sort_key(value):
     parts = re.findall(r'\d+|[A-Za-z]+|[^A-Za-z\d]+', value)
@@ -1478,6 +2074,37 @@ def get_required_glibc_version(elf_path):
 def version_tuple(v):
     return tuple(map(int, v.split('.')))
 
+def parse_debian_gcc_release(comment_text):
+    debian_versions = []
+    for match in re.finditer(r'GCC:\s+\(Debian\s+([0-9]+(?:\.[0-9]+)+)-[^)]*\)\s+([0-9]+(?:\.[0-9]+)+)', comment_text):
+        debian_versions.extend(group for group in match.groups() if group)
+    for gcc_version in debian_versions:
+        release = DEBIAN_GCC_RELEASE_MAP.get(gcc_version)
+        if release:
+            return release, gcc_version
+    for gcc_version in debian_versions:
+        gcc_tuple = version_tuple(gcc_version)
+        for min_version, release in (
+            ("14.2.0", "13"),
+            ("12.2.0", "12"),
+            ("10.2.0", "11"),
+            ("8.3.0", "10"),
+            ("6.3.0", "9"),
+            ("4.8.0", "8"),
+            ("4.4.0", "7"),
+        ):
+            if gcc_tuple >= version_tuple(min_version):
+                return release, gcc_version
+    return None, None
+
+def add_debian_release_hints(versions, release, gcc_version=None):
+    if not release:
+        return
+    versions.add(f"debian_{release}" + (f" (inferred from GCC {gcc_version})" if gcc_version else ""))
+    glibc_version = DEBIAN_GLIBC_MAP.get(release)
+    if glibc_version:
+        versions.add(f"likely_glibc_{glibc_version}")
+
 def get_glibc_version_from_elf(elf_path):
     if not os.path.exists(elf_path):
         log.error(f"文件不存在: {elf_path}")
@@ -1513,9 +2140,12 @@ def get_glibc_version_from_elf(elf_path):
             if 'GCC: (' in line:
                 gcc_line = line.strip()
                 break
+        debian_release, debian_gcc_version = parse_debian_gcc_release(comment_output)
+        if debian_release:
+            add_debian_release_hints(versions, debian_release, debian_gcc_version)
         if gcc_line:
             gcc_ver_match = re.search(r'(\d+)\.(\d+)\.(\d+)', gcc_line)
-            if gcc_ver_match:
+            if gcc_ver_match and 'Debian' not in gcc_line:
                 major = f"{gcc_ver_match.group(1)}.{gcc_ver_match.group(2)}.{gcc_ver_match.group(3)}"
                 gcc_ubuntu_exact = {
                     "15.1.0": "26.04",
@@ -1616,6 +2246,9 @@ def get_glibc_version_from_elf(elf_path):
                 text=True,
                 timeout=20
             ).stdout
+            debian_release, debian_gcc_version = parse_debian_gcc_release(strings_output)
+            if debian_release:
+                add_debian_release_hints(versions, debian_release, debian_gcc_version)
             ubuntu_matches = re.findall(r'Ubuntu\s+([0-9]{2}\.[0-9]{2})', strings_output, re.I)
             for v in ubuntu_matches:
                 versions.add(f"ubuntu_{v}")
@@ -1731,10 +2364,22 @@ def find_by_version_cached(version_info, index, target_arch):
                 if match:
                     target_ubuntu = match.group(1)
                     break
+    target_debian = None
+    for ver in version_info:
+        if ver.startswith('debian_') and 'inferred' not in ver:
+            target_debian = ver.replace('debian_', '')
+            break
+    if not target_debian:
+        for ver in version_info:
+            if ver.startswith('debian_') and 'inferred' in ver:
+                match = re.search(r'debian_([A-Za-z0-9.]+)', ver)
+                if match:
+                    target_debian = match.group(1)
+                    break
 
     log.info(
         f"目标 GLIBC: {stderr_version(target_glibc or 'unknown')}, "
-        f"目标 Ubuntu: {stderr_version(target_ubuntu or 'unknown')}, "
+        f"目标发行版: {stderr_version(('Debian ' + target_debian) if target_debian else (('Ubuntu ' + target_ubuntu) if target_ubuntu else 'unknown'))}, "
         f"目标架构: {stderr_name(target_arch)}"
     )
 
@@ -1791,6 +2436,17 @@ def find_by_version_cached(version_info, index, target_arch):
             if ubuntu_tag in entry_id:
                 score += 30
                 match_reason.append(f"ubuntu_{target_ubuntu}")
+        if target_debian:
+            entry_id = entry.get('id', '')
+            entry_info = entry.get('info', '')
+            debian_version_tag = f'+deb{target_debian}'
+            debian_codename = normalize_debian_release(target_debian)
+            if debian_version_tag in entry_id or 'debian' in entry_info.lower():
+                score += 30
+                match_reason.append(f"debian_{target_debian}")
+            elif debian_codename and debian_codename in entry_id:
+                score += 30
+                match_reason.append(f"debian_{debian_codename}")
 
         if sym_count:
             score += 10
@@ -1931,7 +2587,6 @@ def auto_find_libc(elf_path, candidate_limit=20, group_variants=True):
 
     if not all_matches:
         log.error("未找到匹配的 libc")
-        list_available_versions(index)
         return []
 
     seen = set()
@@ -1952,6 +2607,7 @@ def auto_find_libc(elf_path, candidate_limit=20, group_variants=True):
         return (
             score,
             m.get('symbol_count', 0),
+            preferred_arch_package_score(m.get('name', ''), arch),
             natural_sort_key(extract_release_tag(m.get('name', ''))),
         )
 
@@ -1986,16 +2642,6 @@ def auto_find_libc(elf_path, candidate_limit=20, group_variants=True):
 
     return visible_matches
 
-def list_available_versions(index=None):
-    if index is None:
-        index = ensure_index_cache()
-    if not index:
-        return
-    versions = index.get("versions_sorted", [])
-    log.info(f"数据库中的 GLIBC 版本（共 {stderr_number(len(versions))} 个）:")
-    for v in versions[-20:]:
-        log.info(f"  - {stderr_version(v)}")
-
 def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_needed=None, package_hints=None, extra_packages=None):
     ensure_pwntools_cache_dir()
     libc_dir = None
@@ -2004,12 +2650,11 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
         libc_dir = libcdb.download_libraries(libc_path)
     except Exception as e:
         primary_error = e
-        log.warning(f'主下载链路失败，准备回退到 Ubuntu 仓库索引: {e}')
+        log.warning(f'主下载链路失败，准备回退到 Ubuntu/Debian 仓库索引: {e}')
     if libc_dir is None or not os.path.exists(libc_dir):
-        fallback_dir = download_matching_ubuntu_libc_package(libc_path)
+        fallback_dir = download_matching_deb_libc_package(libc_path)
         if fallback_dir:
             libc_dir = fallback_dir
-            log.success(f'已通过 Ubuntu 仓库索引回退下载 libc: {stderr_path(libc_dir)}')
         else:
             if primary_error is not None:
                 log.failure(f'libc 库下载失败: {primary_error}')
@@ -2017,6 +2662,10 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
                 log.failure('libc 库下载失败，请检查网络、仓库镜像或 libc 文件有效性')
             return None
     libc_dir = libc_dir.decode() if isinstance(libc_dir, bytes) else libc_dir
+    if not find_unstripped_libc_in_dir(libc_dir):
+        unstripped_dir = try_unstrip_cached_libc_dir_from_local_url(libc_path, libc_dir)
+        if unstripped_dir:
+            libc_dir = unstripped_dir
     target_dir = os.path.abspath(target_dir or (os.getcwd() + '/libc_dir'))
     os.makedirs(target_dir, exist_ok=True)
     has_artifacts = False
@@ -2027,13 +2676,23 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
     if not has_artifacts:
         log.failure('下载的 libc 目录为空')
         return None
-    copied_files = copy_shared_object_artifacts(libc_dir, target_dir)
+    copied_files = copy_shared_object_artifacts(
+        libc_dir,
+        target_dir,
+        overwrite=bool(find_unstripped_libc_in_dir(libc_dir)),
+    )
     log.info(f"libc 下载目录 : {stderr_path(libc_dir)}")
     log.info(f"libc 输出目录 : {stderr_path(target_dir)}")
     if copied_files:
         log.info(f"本次新增文件 : {stderr_number(len(copied_files))} 个")
     else:
         log.info("目标目录已存在下载的 libc 文件，本次没有新增复制")
+    unstripped_libc = find_unstripped_libc_in_dir(target_dir)
+    if unstripped_libc:
+        log.success(f"未 strip libc : {stderr_path(unstripped_libc)}")
+    else:
+        log.failure("未能获得带符号的 libc；普通 libc6 包通常是 stripped，需要可用的 libc6-dbg/libc6-dbgsym 或 debuginfod")
+        return None
     extra_package_copied = []
     if extra_packages:
         log.info(
@@ -2134,41 +2793,8 @@ def prompt_input(message, marker='> '):
         raise EOFError
     return line.rstrip('\r\n')
 
-def match_to_json(match):
-    if not match:
-        return None
-    fields = (
-        'name',
-        'path',
-        'match_type',
-        'score',
-        'reason',
-        'glibc_ver',
-        'arch',
-        'info',
-        'symbol_count',
-        'variants',
-        'source',
-    )
-    return {key: match[key] for key in fields if key in match}
-
-def emit_json(payload):
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2))
-    sys.stdout.write('\n')
-    sys.stdout.flush()
-
-def json_exit(payload, code=0):
-    emit_json(payload)
-    sys.exit(code)
-
-def exit_missing_pwntools(json_mode):
+def exit_missing_pwntools():
     message = f"缺少 pwntools，当前功能不可用: {PWN_IMPORT_ERROR}"
-    if json_mode:
-        json_exit({
-            'ok': False,
-            'error': 'missing_pwntools',
-            'detail': str(PWN_IMPORT_ERROR),
-        }, 1)
     log.failure(message)
     sys.exit(1)
 
@@ -2178,55 +2804,46 @@ def main():
     parser.add_argument('file', nargs='?', default=None, help='ELF 文件或 libc 文件路径')
     parser.add_argument('--elf', dest='reference_elf', default=None, help='显式指定要补全依赖的目标 ELF')
     parser.add_argument('--extra-needed', action='append', default=None, help='手动追加要检查/补全的共享库 soname，可重复指定')
-    parser.add_argument('--extra-package', action='append', default=None, help='手动追加要下载的 Ubuntu 包名，可重复指定')
-    parser.add_argument('--package-hint', action='append', default=None, help='手动指定 soname 到 Ubuntu 包名候选映射，例如 libssl.so.1.1=libssl1.1')
+    parser.add_argument('--extra-package', action='append', default=None, help='手动追加要下载的 Debian/Ubuntu 包名，可重复指定')
+    parser.add_argument('--package-hint', action='append', default=None, help='手动指定 soname 到 Debian/Ubuntu 包名候选映射，例如 libssl.so.1.1=libssl1.1')
     parser.add_argument('--all-variants', action='store_true', help='显示并可选择所有 libc 子版本，不按家族合并')
     parser.add_argument('--candidate-limit', type=int, default=20, help='候选 libc 显示/可选上限，默认 20，传 0 表示不限制')
-    parser.add_argument('--default', dest='use_default', action='store_true', help='使用默认推荐并自动确认所有交互')
-    parser.add_argument('--select', type=int, default=None, help='非交互模式下选择候选 libc 索引')
-    parser.add_argument('--json', action='store_true', help='以 JSON 输出结果；默认不交互且不执行下载')
-    parser.add_argument('--no-download', action='store_true', help='不下载 libc 调试信息')
     parser.add_argument('--download', '-d', action='store_true', help='直接从给出的 libc 文件下载调试信息（跳过查找和交互）')
-    parser.add_argument('--doctor', action='store_true', help='执行环境自检并报告依赖、网络和路径状态')
+    parser.add_argument('--doctor', action='store_true', help='只执行环境自检')
     parser.add_argument('--output-dir', default=None, help='指定下载输出目录，默认使用输入文件所在目录下的 libc_dir')
-    parser.add_argument('--list', action='store_true', help='列出数据库中所有可用版本')
     parser.add_argument('--rebuild-index', action='store_true', help='重建索引缓存')
     args = parser.parse_args()
 
-    json_mode = args.json
-    if json_mode:
-        context.log_level = 'critical'
+    if args.doctor:
+        report = run_doctor()
+        print_doctor_report(report)
+        if not report['ok']:
+            sys.exit(1)
+        return
 
     try:
         extra_needed = normalize_soname_list(args.extra_needed)
         extra_packages = normalize_package_name_list(args.extra_package)
         package_hints = parse_package_hint_specs(args.package_hint)
     except ValueError as e:
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'invalid_extra_dependency_option',
-                'detail': str(e),
-            }, 1)
         parser.error(str(e))
+
+    if args.candidate_limit is not None and args.candidate_limit < 0:
+        parser.error('--candidate-limit 必须大于等于 0')
+
+    if PWN_IMPORT_ERROR is not None:
+        exit_missing_pwntools()
+
+    if args.rebuild_index:
+        log.info("重建索引缓存...")
+        if not rebuild_index_cache(force=True, quiet=False):
+            sys.exit(1)
+        log.success("索引缓存已重建")
+        return
 
     args.file, auto_libc_candidates = auto_resolve_input_file(args.file, args.reference_elf)
     auto_require_input = bool(args.reference_elf or extra_needed or extra_packages)
     if not args.file and auto_require_input:
-        detail = {
-            'search_dir': (
-                os.path.dirname(os.path.abspath(args.reference_elf))
-                if args.reference_elf else
-                os.getcwd()
-            ),
-            'candidates': auto_libc_candidates,
-        }
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'auto_detect_libc_failed',
-                **detail,
-            }, 1)
         if auto_libc_candidates:
             log.failure(
                 "未能自动确定 libc 文件，请显式传入；候选: " +
@@ -2236,92 +2853,7 @@ def main():
             log.failure("未找到可用的 libc 文件，请显式传入")
         sys.exit(1)
 
-    if args.doctor:
-        report = run_doctor(
-            args.file,
-            args.reference_elf,
-            args.output_dir,
-            extra_needed=extra_needed,
-            package_hints=package_hints,
-            extra_packages=extra_packages,
-        )
-        if json_mode:
-            json_exit(report, 0 if report['ok'] else 1)
-        print_doctor_report(report)
-        if not report['ok']:
-            sys.exit(1)
-        return
-
-    if args.select is not None and args.select < 0:
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'select_must_be_non_negative',
-                'requested_index': args.select,
-            }, 1)
-        parser.error('--select 必须大于等于 0')
-    if args.candidate_limit is not None and args.candidate_limit < 0:
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'candidate_limit_must_be_non_negative',
-                'requested_limit': args.candidate_limit,
-            }, 1)
-        parser.error('--candidate-limit 必须大于等于 0')
-
-    if PWN_IMPORT_ERROR is not None:
-        exit_missing_pwntools(json_mode)
-
-    if args.rebuild_index:
-        if json_mode:
-            index = rebuild_index_cache(force=True, quiet=True)
-            if not index_cache_is_compatible(index):
-                json_exit({
-                    'ok': False,
-                    'mode': 'rebuild_index',
-                    'error': 'rebuild_index_failed',
-                    'cache_path': LIBC_INDEX_CACHE,
-                }, 1)
-            json_exit({
-                'ok': True,
-                'mode': 'rebuild_index',
-                'cache_path': LIBC_INDEX_CACHE,
-                'entries': len(index.get('entries', [])),
-                'versions': len(index.get('by_version', {})),
-            })
-
-        log.info("重建索引缓存...")
-        if not rebuild_index_cache(force=True, quiet=False):
-            sys.exit(1)
-        log.success("索引缓存已重建")
-        return
-
-    if args.list:
-        if json_mode:
-            index = ensure_index_cache()
-            if not index:
-                json_exit({
-                    'ok': False,
-                    'mode': 'list',
-                    'error': 'load_index_failed',
-                }, 1)
-            versions = index.get('versions_sorted', [])
-            json_exit({
-                'ok': True,
-                'mode': 'list',
-                'count': len(versions),
-                'versions': versions,
-            })
-
-        list_available_versions()
-        return
-
     if not args.file:
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'missing_file_argument',
-            }, 1)
         parser.print_help()
         return
 
@@ -2329,67 +2861,20 @@ def main():
         log.info(f"自动使用 libc: {stderr_path(args.file)}")
 
     if not os.path.exists(args.file):
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'file_not_found',
-                'path': args.file,
-            }, 1)
         log.error(f"文件不存在: {stderr_path(args.file)}")
         sys.exit(1)
 
     if args.reference_elf and not os.path.exists(args.reference_elf):
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'reference_elf_not_found',
-                'path': args.reference_elf,
-            }, 1)
         log.error(f"指定的 ELF 不存在: {stderr_path(args.reference_elf)}")
         sys.exit(1)
 
     if args.reference_elf and not is_elf_file(args.reference_elf):
-        if json_mode:
-            json_exit({
-                'ok': False,
-                'error': 'reference_elf_invalid',
-                'path': args.reference_elf,
-            }, 1)
         log.error(f"指定的目标不是有效 ELF: {stderr_path(args.reference_elf)}")
         sys.exit(1)
 
     if args.download:
         reference_elf = resolve_reference_elf_arg(args.file, args.reference_elf)
         target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(args.file, reference_elf)
-        if json_mode:
-            download_dir = download_and_setup_libc(
-                args.file,
-                elf_path=reference_elf,
-                target_dir=target_dir,
-                extra_needed=extra_needed,
-                package_hints=package_hints,
-                extra_packages=extra_packages,
-            )
-            json_exit({
-                'ok': download_dir is not None,
-                'mode': 'download_only',
-                'input': {
-                    'path': args.file,
-                    'kind': 'libc',
-                },
-                'selected': {
-                    'name': os.path.basename(args.file),
-                    'path': args.file,
-                    'source': 'input',
-                },
-                'actions': {
-                    'download_performed': download_dir is not None,
-                    'download_dir': download_dir,
-                },
-                'effective_libc_path': args.file,
-                'error': None if download_dir is not None else 'download_failed',
-            }, 0 if download_dir is not None else 1)
-
         log.info(f"直接从 {stderr_path(args.file)} 下载 libc 调试信息...")
         download_and_setup_libc(
             args.file,
@@ -2404,24 +2889,6 @@ def main():
     file_kind = 'libc' if is_libc_family_name(args.file) else ('elf' if is_elf_file(args.file) else 'libc')
     reference_elf = resolve_reference_elf_arg(args.file, args.reference_elf)
     target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(args.file, reference_elf)
-    result = {
-        'ok': True,
-        'mode': 'match' if file_kind == 'elf' else 'direct_libc',
-        'input': {
-            'path': args.file,
-            'kind': file_kind,
-        },
-        'selection_mode': None,
-        'candidate_count': 0,
-        'candidates': [],
-        'selected_index': None,
-        'selected': None,
-        'effective_libc_path': None,
-        'actions': {
-            'download_performed': False,
-            'download_dir': None,
-        },
-    }
 
     if file_kind == 'elf':
         log.info("检测到 ELF 文件，开始查找匹配的 libc...")
@@ -2431,76 +2898,37 @@ def main():
             group_variants=not args.all_variants,
         )
         if not matches:
-            if json_mode:
-                result['ok'] = False
-                result['error'] = 'no_matches'
-                json_exit(result, 1)
             sys.exit(1)
-
-        result['candidate_count'] = len(matches)
-        result['candidates'] = [match_to_json(match) for match in matches]
 
         selected_index = 0
         selected_match = matches[0]
-        if args.select is not None:
-            if args.select >= len(matches):
-                if json_mode:
-                    result['ok'] = False
-                    result['error'] = 'select_out_of_range'
-                    result['requested_index'] = args.select
-                    result['valid_index_range'] = [0, len(matches) - 1]
-                    json_exit(result, 1)
-                log.error(
-                    f"--select 索引 {stderr_number(args.select)} 超出范围，"
-                    f"当前候选范围是 {stderr_number(0)}-{stderr_number(len(matches) - 1)}"
-                )
-                sys.exit(1)
-            selected_index = args.select
-            selected_match = matches[selected_index]
-            result['selection_mode'] = 'select'
-            log.info(f"使用 --select 选择候选 [{stderr_choice(selected_index)}]: {stderr_name(selected_match['name'])}")
-        elif args.use_default:
-            result['selection_mode'] = 'default_auto'
-            log.info(f"使用 --default 自动选择推荐候选 [{stderr_choice(0)}]: {stderr_name(selected_match['name'])}")
-        elif json_mode:
-            result['selection_mode'] = 'json_default'
-        else:
-            result['selection_mode'] = 'interactive'
-            try:
-                if len(matches) > 1:
-                    choice = prompt_input(f"\n请选择要使用的 libc (0-{len(matches)-1})，默认 0，输入 q 退出。").strip()
-                else:
-                    choice = prompt_input(f"\n找到 1 个匹配: {selected_match['name']}。回车确认，或输入 q 退出。").strip()
+        try:
+            if len(matches) > 1:
+                choice = prompt_input(f"\n请选择要使用的 libc (0-{len(matches)-1})，默认 0，输入 q 退出。").strip()
+            else:
+                choice = prompt_input(f"\n找到 1 个匹配: {selected_match['name']}。回车确认，或输入 q 退出。").strip()
 
-                if choice and choice.lower() == 'q':
-                    log.info("已取消操作")
-                    return
-
-                if choice and len(matches) > 1:
-                    idx = int(choice)
-                    if 0 <= idx < len(matches):
-                        selected_index = idx
-                        selected_match = matches[selected_index]
-                    else:
-                        log.warning(f"索引 {stderr_number(idx)} 超出范围，使用默认推荐")
-            except ValueError:
-                log.warning("无效输入，使用默认推荐")
-            except EOFError:
+            if choice and choice.lower() == 'q':
                 log.info("已取消操作")
                 return
 
+            if choice and len(matches) > 1:
+                idx = int(choice)
+                if 0 <= idx < len(matches):
+                    selected_index = idx
+                    selected_match = matches[selected_index]
+                else:
+                    log.warning(f"索引 {stderr_number(idx)} 超出范围，使用默认推荐")
+        except ValueError:
+            log.warning("无效输入，使用默认推荐")
+        except EOFError:
+            log.info("已取消操作")
+            return
+
         libc_path = selected_match['path']
-        result['selected_index'] = selected_index
-        result['selected'] = match_to_json(selected_match)
     else:
         log.info("使用提供的 libc 文件...")
         libc_path = args.file
-        result['selection_mode'] = 'direct_input'
-        result['selected'] = {
-            'name': os.path.basename(args.file),
-            'path': args.file,
-            'source': 'input',
-        }
         if extra_needed:
             log.info(
                 "手动追加依赖 : " +
@@ -2514,43 +2942,25 @@ def main():
         if not reference_elf and not extra_packages:
             log.warning("未自动关联到目标 ELF，额外依赖补全不会执行；可使用 --elf 显式指定")
 
-    if not args.no_download:
-        if args.use_default:
-            do_dl = True
-            log.info("使用 --default 自动下载 libc 调试信息")
-        elif json_mode:
-            do_dl = False
-        else:
-            try:
-                do_dl = prompt_input("\n下载 libc 调试信息？默认 Y，输入 n 跳过，输入 q 退出。").lower().strip()
-                if do_dl == 'q':
-                    log.info("已取消操作")
-                    return
-                do_dl = do_dl != 'n'
-            except EOFError:
-                do_dl = True
+    try:
+        do_dl = prompt_input("\n下载 libc 调试信息？默认 Y，输入 n 跳过，输入 q 退出。").lower().strip()
+        if do_dl == 'q':
+            log.info("已取消操作")
+            return
+        do_dl = do_dl != 'n'
+    except EOFError:
+        do_dl = True
 
-        if do_dl:
-            log.info("开始下载 libc 调试信息...")
-            download_dir = download_and_setup_libc(
-                libc_path,
-                elf_path=reference_elf,
-                target_dir=target_dir,
-                extra_needed=extra_needed,
-                package_hints=package_hints,
-                extra_packages=extra_packages,
-            )
-            result['actions']['download_performed'] = download_dir is not None
-            result['actions']['download_dir'] = download_dir
-            if json_mode and download_dir is None:
-                result['ok'] = False
-                result['error'] = 'download_failed'
-                result['effective_libc_path'] = libc_path
-                json_exit(result, 1)
-
-    result['effective_libc_path'] = libc_path
-    if json_mode:
-        json_exit(result, 0 if result['ok'] else 1)
+    if do_dl:
+        log.info("开始下载 libc 调试信息...")
+        download_and_setup_libc(
+            libc_path,
+            elf_path=reference_elf,
+            target_dir=target_dir,
+            extra_needed=extra_needed,
+            package_hints=package_hints,
+            extra_packages=extra_packages,
+        )
 
 if __name__ == "__main__":
     main()
