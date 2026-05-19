@@ -68,6 +68,7 @@ LIBC_DB_PATH = "/home/starlight/CtfTools/libc-database/db"
 LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
 CACHE_SCHEMA_VERSION = 5
 INDEX_BUILD_MAX_WORKERS = 8
+FILE_ANALYSIS_CACHE = {}
 COMMON_LIBC_SYMBOLS = [
     '__libc_start_main',
     'system',
@@ -590,12 +591,12 @@ def run_doctor():
         'ok' if pwn_ok else 'error',
         'pwntools 已加载' if pwn_ok else f'缺少 pwntools: {PWN_IMPORT_ERROR}',
     )
-    for module_name, required in [('unix_ar', True), ('zstandard', False)]:
+    for module_name, required in [('unix_ar', False), ('zstandard', False)]:
         ok, origin = module_check(module_name)
         append_doctor_check(
             checks,
             f'python_module:{module_name}',
-            'ok' if ok else ('error' if required else 'warning'),
+            'ok' if ok else 'warning',
             origin or '未安装',
             required=required,
         )
@@ -684,26 +685,14 @@ def print_doctor_report(report):
         log.failure("环境自检未通过")
 
 def get_ubuntu_glibc_package_version(libc_path):
-    try:
-        strings_output = subprocess.check_output(
-            ['strings', libc_path],
-            stderr=subprocess.DEVNULL,
-        ).decode(errors='ignore')
-    except Exception:
-        return None
+    strings_output = cached_file_analysis(libc_path).get('strings', '')
     match = re.search(r"GNU C Library \(Ubuntu E?GLIBC ([^)]+)\)", strings_output)
     if match:
         return match.group(1)
     return None
 
 def get_debian_glibc_package_version(libc_path):
-    try:
-        strings_output = subprocess.check_output(
-            ['strings', libc_path],
-            stderr=subprocess.DEVNULL,
-        ).decode(errors='ignore')
-    except Exception:
-        return None
+    strings_output = cached_file_analysis(libc_path).get('strings', '')
     match = re.search(r"GNU C Library \(Debian GLIBC ([^)]+)\)", strings_output)
     if match:
         return match.group(1)
@@ -754,6 +743,48 @@ def normalize_debian_release(release):
     if not release:
         return None
     return DEBIAN_CODENAME_MAP.get(str(release).strip().lower())
+
+def cached_file_analysis(file_path):
+    abs_path = os.path.abspath(file_path)
+    try:
+        stat_result = os.stat(abs_path)
+    except OSError:
+        return {
+            'strings': '',
+            'objdump_t': '',
+            'comment': '',
+            'readelf_hn': '',
+        }
+    cache_key = (abs_path, stat_result.st_mtime_ns, stat_result.st_size)
+    cached = FILE_ANALYSIS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    analysis = {
+        'strings': '',
+        'objdump_t': '',
+        'comment': '',
+        'readelf_hn': '',
+    }
+    commands = (
+        ('strings', ['strings', abs_path], None, 20),
+        ('objdump_t', ['objdump', '-T', abs_path], None, 15),
+        ('comment', ['readelf', '-p', '.comment', abs_path], readelf_env(), 10),
+        ('readelf_hn', ['readelf', '-h', '-n', abs_path], readelf_env(), 10),
+    )
+    for field, command, env, timeout in commands:
+        try:
+            analysis[field] = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            ).stdout
+        except Exception:
+            analysis[field] = ''
+    FILE_ANALYSIS_CACHE[cache_key] = analysis
+    return analysis
 
 def ensure_ubuntu_repo_root(base_url):
     repo_root = (base_url or '').rstrip('/')
@@ -1235,8 +1266,78 @@ def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None, over
             seen.add(target_file)
     return copied
 
+def extract_all_from_deb_with_system_tools(cache_dir, package_filename, package_data):
+    ar_path = shutil.which('ar')
+    bsdtar_path = shutil.which('bsdtar')
+    if not ar_path and not bsdtar_path:
+        raise RuntimeError("missing unix_ar and no system ar/bsdtar available")
+
+    package_tmp = None
+    unpack_dir = None
+    try:
+        fd, package_tmp = tempfile.mkstemp(prefix=package_filename + '.', suffix='.deb')
+        with os.fdopen(fd, 'wb') as f:
+            f.write(package_data)
+
+        if ar_path:
+            unpack_dir = tempfile.mkdtemp(prefix='libc-tool-deb-')
+            result = subprocess.run(
+                [ar_path, 't', package_tmp],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or '').strip()
+                raise RuntimeError(f"ar list failed: {detail}")
+            members = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            data_name = next((name for name in members if name.startswith('data.tar')), None)
+            if not data_name:
+                raise ValueError(f"missing data.tar in {package_filename}")
+            result = subprocess.run(
+                [ar_path, 'x', package_tmp, data_name],
+                cwd=unpack_dir,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or '').strip()
+                raise RuntimeError(f"ar extract failed: {detail}")
+            tar_path = os.path.join(unpack_dir, data_name)
+            with tarfile.open(tar_path, mode='r:*') as tar_obj:
+                dest_root = os.path.abspath(cache_dir)
+                for member in tar_obj.getmembers():
+                    member_path = os.path.abspath(os.path.join(cache_dir, member.name))
+                    if not member_path.startswith(dest_root + os.sep) and member_path != dest_root:
+                        raise ValueError(f"archive path escapes target dir: {member.name}")
+                tar_obj.extractall(cache_dir)
+            return
+
+        result = subprocess.run(
+            [bsdtar_path, '-xf', package_tmp, '-C', cache_dir],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or '').strip()
+            raise RuntimeError(f"bsdtar extract failed: {detail}")
+    finally:
+        if unpack_dir:
+            shutil.rmtree(unpack_dir, ignore_errors=True)
+        if package_tmp and os.path.exists(package_tmp):
+            try:
+                os.unlink(package_tmp)
+            except OSError:
+                pass
+
 def extract_all_from_deb(cache_dir, package_filename, package_data):
-    import unix_ar
+    try:
+        import unix_ar
+    except ImportError:
+        extract_all_from_deb_with_system_tools(cache_dir, package_filename, package_data)
+        return
     from io import BytesIO
 
     def _safe_extract_all(tar_obj, dest_dir):
@@ -1781,14 +1882,7 @@ def inspect_elf_metadata(elf_path):
     build_id = None
     arch = "unknown"
     try:
-        result = subprocess.run(
-            ["readelf", "-h", "-n", elf_path],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=readelf_env(),
-        )
-        output = result.stdout
+        output = cached_file_analysis(elf_path).get('readelf_hn', '')
         match = re.search(r'Build ID:\s*([a-f0-9]+)', output)
         build_id = match.group(1).lower() if match else None
         arch = parse_arch_from_readelf_output(output)
@@ -2059,13 +2153,7 @@ def extract_glibc_versions(text):
 
 def get_required_glibc_version(elf_path):
     try:
-        result = subprocess.run(
-            ["objdump", "-T", elf_path],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        versions = extract_glibc_versions(result.stdout)
+        versions = extract_glibc_versions(cached_file_analysis(elf_path).get('objdump_t', ''))
         if versions:
             return versions[-1]
     except Exception:
@@ -2110,14 +2198,9 @@ def get_glibc_version_from_elf(elf_path):
         log.error(f"文件不存在: {elf_path}")
         return set()
     versions = set()
-    objdump_output = ""
+    analysis = cached_file_analysis(elf_path)
+    objdump_output = analysis.get('objdump_t', '')
     try:
-        objdump_output = subprocess.run(
-            ["objdump", "-T", elf_path],
-            capture_output=True,
-            text=True,
-            timeout=15
-        ).stdout
         glibc_matches = extract_glibc_versions(objdump_output)
         for v in glibc_matches:
             versions.add(f"glibc_{v}")
@@ -2128,13 +2211,7 @@ def get_glibc_version_from_elf(elf_path):
     except Exception as e:
         log.debug(f"objdump GLIBC 分析失败: {e}")
     try:
-        comment_output = subprocess.run(
-            ["readelf", "-p", ".comment", elf_path],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=readelf_env(),
-        ).stdout
+        comment_output = analysis.get('comment', '')
         gcc_line = ""
         for line in comment_output.splitlines():
             if 'GCC: (' in line:
@@ -2240,12 +2317,7 @@ def get_glibc_version_from_elf(elf_path):
 
     if not versions:
         try:
-            strings_output = subprocess.run(
-                ["strings", elf_path],
-                capture_output=True,
-                text=True,
-                timeout=20
-            ).stdout
+            strings_output = analysis.get('strings', '')
             debian_release, debian_gcc_version = parse_debian_gcc_release(strings_output)
             if debian_release:
                 add_debian_release_hints(versions, debian_release, debian_gcc_version)
@@ -2743,7 +2815,7 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
 
     with open(libc_path, 'rb') as f:
         log.info(f"源 libc sha256 : {stderr_hash(hashlib.sha256(f.read()).hexdigest())}")
-    src_strings = subprocess.check_output(['strings', libc_path], stderr=subprocess.DEVNULL).decode(errors='ignore')
+    src_strings = cached_file_analysis(libc_path).get('strings', '')
     for line in src_strings.splitlines():
         if 'GNU C Library' in line:
             log.info(f"源 libc string : {stderr_style(line.strip(), 'yellow')}")
@@ -2762,7 +2834,7 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
                 f"匹配 libc sha256 ({stderr_name(os.path.basename(fpath))}) : "
                 f"{stderr_hash(hashlib.sha256(f.read()).hexdigest())}"
             )
-        matched_strings = subprocess.check_output(['strings', fpath], stderr=subprocess.DEVNULL).decode(errors='ignore')
+        matched_strings = cached_file_analysis(fpath).get('strings', '')
         for line in matched_strings.splitlines():
             if 'GNU C Library' in line:
                 log.info(
