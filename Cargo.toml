@@ -1,0 +1,8 @@
+[package]
+name = "libc_tool_core"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "libc_tool_core"
+path = "rust/libc_tool_core.rs"

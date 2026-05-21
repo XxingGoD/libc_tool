@@ -70,6 +70,7 @@ LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
 CACHE_SCHEMA_VERSION = 5
 INDEX_BUILD_MAX_WORKERS = 8
 FILE_ANALYSIS_CACHE = {}
+ELF_FAST_INFO_CACHE = {}
 COMMON_LIBC_SYMBOLS = [
     '__libc_start_main',
     'system',
@@ -286,6 +287,75 @@ def ensure_pwntools_cache_dir():
             return context.cache_dir
     return None
 
+def find_rust_core_binary():
+    candidates = []
+    env_path = os.environ.get("LIBC_TOOL_CORE")
+    if env_path:
+        candidates.append(env_path)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.extend([
+        os.path.join(script_dir, 'libc_tool_core'),
+        os.path.join(script_dir, 'target', 'release', 'libc_tool_core'),
+        os.path.join(os.getcwd(), 'target', 'release', 'libc_tool_core'),
+    ])
+    path_candidate = shutil.which('libc_tool_core')
+    if path_candidate:
+        candidates.append(path_candidate)
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+def run_rust_core(args, input_text, timeout=10):
+    core_path = find_rust_core_binary()
+    if not core_path:
+        return None
+    try:
+        result = subprocess.run(
+            [core_path] + list(args),
+            input=input_text or '',
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=readelf_env(),
+        )
+    except Exception as e:
+        log.debug(f"Rust core 执行失败: {e}")
+        return None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or '').strip()
+        log.debug(f"Rust core 返回失败: {detail}")
+        return None
+    return result.stdout
+
+def inspect_elf_fast(elf_path):
+    abs_path = os.path.abspath(elf_path)
+    try:
+        stat_result = os.stat(abs_path)
+    except OSError:
+        return None
+    cache_key = (abs_path, stat_result.st_mtime_ns, stat_result.st_size)
+    cached = ELF_FAST_INFO_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    core_output = run_rust_core(['inspect-elf', abs_path], '', timeout=5)
+    if core_output is None:
+        return None
+    try:
+        info = json.loads(core_output)
+    except json.JSONDecodeError as e:
+        log.debug(f"Rust core ELF JSON 解析失败: {e}")
+        return None
+    if not isinstance(info, dict):
+        return None
+    info.setdefault('build_id', None)
+    info.setdefault('arch', 'unknown')
+    info.setdefault('has_dynamic', False)
+    info.setdefault('has_debug', False)
+    info.setdefault('needed', [])
+    ELF_FAST_INFO_CACHE[cache_key] = info
+    return info
+
 def libc_tool_cache_targets():
     targets = []
     cache_dir = ensure_pwntools_cache_dir()
@@ -456,6 +526,9 @@ def guess_package_names_from_soname_with_hints(soname, package_hints=None):
     return candidates
 
 def get_needed_shared_libraries(elf_path):
+    fast_info = inspect_elf_fast(elf_path)
+    if fast_info is not None and fast_info.get('needed'):
+        return list(dict.fromkeys(fast_info.get('needed') or []))
     try:
         result = subprocess.run(
             ['readelf', '-d', elf_path],
@@ -619,6 +692,9 @@ def abi_version_sort_key(token):
 
 def extract_abi_version_tokens(text_value, prefixes=None):
     prefixes = tuple(prefixes or ())
+    core_output = run_rust_core(['extract-abi-tokens'] + list(prefixes), text_value or '')
+    if core_output is not None:
+        return {line.strip() for line in core_output.splitlines() if line.strip()}
     tokens = set(ABI_VERSION_TOKEN_RE.findall(text_value or ''))
     if prefixes:
         tokens = {token for token in tokens if token.startswith(prefixes)}
@@ -1328,6 +1404,23 @@ def iter_deb_package_urls(package_names, distro, release, arch, package_version=
         except Exception as e:
             log.warning(f"获取 {distro_label} 包索引失败: {index_url} ({e})")
             continue
+        core_args = [
+            'filter-package-urls',
+            repo_root,
+            arch,
+            ','.join(package_names),
+            package_version or '',
+            package_filename or '',
+        ]
+        core_output = run_rust_core(core_args, index_text, timeout=10)
+        if core_output is not None:
+            for package_url in core_output.splitlines():
+                package_url = package_url.strip()
+                if not package_url or package_url in seen_urls:
+                    continue
+                seen_urls.add(package_url)
+                yield package_url
+            continue
         entries = []
         for entry in iter_debian_control_entries(index_text):
             if entry.get('Package') not in wanted:
@@ -1586,6 +1679,9 @@ def find_local_libc_database_url(libc_path):
     return re.sub(r'(?<!:)//+', '/', package_url)
 
 def elf_has_dynamic_section(elf_path):
+    fast_info = inspect_elf_fast(elf_path)
+    if fast_info is not None:
+        return bool(fast_info.get('has_dynamic'))
     try:
         result = subprocess.run(
             ['readelf', '-d', elf_path],
@@ -1826,6 +1922,9 @@ def download_and_extract_deb_package(package_url, cache_key):
     return cache_dir
 
 def elf_has_debug_symbols(elf_path):
+    fast_info = inspect_elf_fast(elf_path)
+    if fast_info is not None:
+        return bool(fast_info.get('has_debug'))
     try:
         result = subprocess.run(
             ['readelf', '-S', elf_path],
@@ -2425,6 +2524,12 @@ def parse_arch_from_readelf_output(output):
 def inspect_elf_metadata(elf_path):
     build_id = None
     arch = "unknown"
+    fast_info = inspect_elf_fast(elf_path)
+    if fast_info is not None:
+        build_id = fast_info.get('build_id')
+        arch = normalize_arch_name(fast_info.get('arch', 'unknown'))
+        if arch != "unknown":
+            return build_id, arch
     try:
         output = cached_file_analysis(elf_path).get('readelf_hn', '')
         match = re.search(r'Build ID:\s*([a-f0-9]+)', output)
@@ -2481,9 +2586,61 @@ def index_build_worker_count(total):
     cpu_count = os.cpu_count() or 4
     return max(1, min(total, INDEX_BUILD_MAX_WORKERS, cpu_count))
 
+def build_index_cache_with_rust(db_path=LIBC_DB_PATH, cache_path=LIBC_INDEX_CACHE, emit=None):
+    if emit is None:
+        emit = print
+    core_path = find_rust_core_binary()
+    if not core_path:
+        return None
+    total = sum(1 for name in os.listdir(db_path) if name.endswith('.so'))
+    emit(
+        f"{stdout_heading('Rust core scanning')} {stdout_number(total)} libc files..."
+    )
+    core_output = run_rust_core(
+        [
+            'build-index',
+            db_path,
+            str(CACHE_SCHEMA_VERSION),
+            ','.join(COMMON_LIBC_SYMBOLS),
+        ],
+        '',
+        timeout=120,
+    )
+    if core_output is None:
+        return None
+    try:
+        index = json.loads(core_output)
+    except json.JSONDecodeError as e:
+        log.warning(f"Rust core 索引 JSON 解析失败: {e}")
+        return None
+    if not index_cache_is_compatible(index):
+        log.warning("Rust core 生成的索引不兼容，回退 Python 索引构建")
+        return None
+
+    emit("")
+    emit(stdout_ok("Rust index built:"))
+    emit(f"  Entries: {stdout_number(len(index['entries']))}")
+    emit(f"  Build IDs: {stdout_number(len(index['by_build_id']))}")
+    emit(f"  SHA1 hashes: {stdout_number(len(index['by_sha1']))}")
+    emit(f"  Versions: {stdout_number(len(index['by_version']))}")
+    emit(f"  Symbol indices: {stdout_number(sum(len(v) for v in index['by_symbol_suffix'].values()))}")
+
+    try:
+        with open(cache_path, 'w') as f:
+            json.dump(index, f)
+        emit("")
+        emit(f"{stdout_ok('Cache saved to:')} {stdout_path(cache_path)}")
+    except OSError as e:
+        log.warning(f"索引缓存写入失败，将使用内存索引继续: {e}")
+    return index
+
 def build_index_cache(db_path=LIBC_DB_PATH, cache_path=LIBC_INDEX_CACHE, emit=None):
     if emit is None:
         emit = print
+
+    rust_index = build_index_cache_with_rust(db_path, cache_path, emit=emit)
+    if rust_index is not None:
+        return rust_index
 
     index = {
         "schema_version": CACHE_SCHEMA_VERSION,
@@ -3583,7 +3740,16 @@ def main():
     parser.add_argument('--output-dir', default=None, help='指定下载输出目录，默认使用输入文件所在目录下的 libc_dir')
     parser.add_argument('--rebuild-index', action='store_true', help='重建索引缓存')
     parser.add_argument('--clear-cache', '-C', action='store_true', help='清理 libc_tool/pwntools 下载缓存和 libc 索引缓存')
+    parser.add_argument('--core-info', action='store_true', help='显示 Rust core 加速后端状态')
     args = parser.parse_args(ORIGINAL_ARGV)
+
+    if args.core_info:
+        core_path = find_rust_core_binary()
+        if core_path:
+            log.success(f"Rust core: {stderr_path(core_path)}")
+        else:
+            log.warning("Rust core 未找到，将使用纯 Python 回退")
+        return
 
     if args.doctor:
         report = run_doctor()

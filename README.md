@@ -16,10 +16,47 @@
 - `zstandard`
 - `eu-unstrip`（来自 `elfutils`，用于把 `libc6-dbg` / `libc6-dbgsym` 合并成未 strip 的 libc）
 - `readelf`、`objdump`、`strings`
+- 可选：Rust/Cargo，用于构建 `libc_tool_core`
 检查：
 
 ```bash
 python3 libc_tool.py --doctor
+```
+
+## Rust Core
+
+`libc_tool.py` 仍是入口，Rust core 是可选加速后端。当前迁移到 Rust 的路径：
+
+- ELF 基础解析：build-id、架构、`DT_NEEDED`、是否有 `.dynamic`、是否有 debug section
+- `libc-database` 索引构建：sha1、build-id、架构、版本、常用符号 suffix 索引
+- `GLIBCXX_*` / `CXXABI_*` / `GCC_*` / `GLIBC_*` / `GLIBC_ABI_*` token 提取
+- Debian/Ubuntu `Packages` control entries 扫描和候选包 URL 排序
+
+构建：
+
+```bash
+cargo build --release
+```
+
+Python 会按以下顺序查找 core：
+
+- 环境变量 `LIBC_TOOL_CORE`
+- `libc_tool.py` 同目录下的 `libc_tool_core`
+- 仓库内 `target/release/libc_tool_core`
+- `PATH` 中的 `libc_tool_core`
+
+查看是否启用：
+
+```bash
+python3 libc_tool.py --core-info
+```
+
+如果找不到 Rust core，工具自动回退到纯 Python 实现。
+
+重建索引时如果 Rust core 可用，会优先走 Rust：
+
+```bash
+python3 libc_tool.py --rebuild-index
 ```
 
 ## libc-database
@@ -104,6 +141,7 @@ python3 libc_tool.py --download --elf ./pwn ./libc.so
 - `libstdc++.so.6`: `GLIBCXX_*`、`CXXABI_*`
 - `libgcc_s.so.1`: `GCC_*`
 
+目录里已有同名库但 ABI 或运行时 libc 版本不满足时，会继续尝试其他 Debian/Ubuntu 包，避免混入宿主机过新的 `libstdc++.so.6` / `libgcc_s.so.1`。
 
 补一个额外库：
 
@@ -172,4 +210,3 @@ patch:
 patchelf --set-interpreter "$PWD/libc_dir/ld-linux-x86-64.so.2" ./pwn
 patchelf --force-rpath --set-rpath '$ORIGIN/libc_dir:$ORIGIN' ./pwn
 ```
-
