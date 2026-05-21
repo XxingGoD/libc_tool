@@ -6,7 +6,7 @@
 - 从已有 `libc.so` 下载整套运行库
 - 按目标程序的 `DT_NEEDED` 补缺的共享库
 - 按 `soname` 或 Debian/Ubuntu 包名补额外依赖
-- 用 `--doctor` 先做环境检查
+- 自动校验 `libstdc++.so.6` / `libgcc_s.so.1` 的 ABI 版本需求
 
 ## 依赖
 
@@ -17,6 +17,7 @@
 - `eu-unstrip`（来自 `elfutils`，用于把 `libc6-dbg` / `libc6-dbgsym` 合并成未 strip 的 libc）
 - `readelf`、`objdump`、`strings`
 检查：
+
 ```bash
 python3 libc_tool.py --doctor
 ```
@@ -61,6 +62,21 @@ LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
 
 路径需要绝对路径
 
+## 匹配排序
+
+查 ELF 时会综合多种信号排序候选 libc：
+
+- hash / build-id / 符号地址
+- 目标架构
+- Ubuntu / Debian 发行版
+- GLIBC 版本
+
+默认只显示前 20 个候选。查看所有子版本或取消数量限制：
+
+```bash
+python3 libc_tool.py --all-variants --candidate-limit 0 ./pwn
+```
+
 ## 常用命令
 
 查匹配：
@@ -83,6 +99,12 @@ python3 libc_tool.py --download ./libc.so
 python3 libc_tool.py --download --elf ./pwn ./libc.so
 ```
 
+如果目标 ELF 依赖 C++ 运行库，工具会从 ELF 的 version need 中提取并校验：
+
+- `libstdc++.so.6`: `GLIBCXX_*`、`CXXABI_*`
+- `libgcc_s.so.1`: `GCC_*`
+
+
 补一个额外库：
 
 ```bash
@@ -95,8 +117,59 @@ python3 libc_tool.py --download --elf ./pwn --extra-needed libstdc++.so.6 ./libc
 python3 libc_tool.py --download --extra-package libseccomp2 ./libc.so
 ```
 
+手动指定 soname 到包名映射：
+
+```bash
+python3 libc_tool.py --download --elf ./pwn --package-hint libssl.so.1.1=libssl1.1 ./libc.so
+```
+
 默认输出到输入文件同目录下的 `libc_dir`，也可以自己指定：
 
 ```bash
 python3 libc_tool.py --download --output-dir ./my_libs --elf ./pwn ./libc.so
 ```
+
+重建 libc 索引缓存：
+
+```bash
+python3 libc_tool.py --rebuild-index
+```
+
+清理缓存：
+
+```bash
+python3 libc_tool.py --clear-cache
+python3 libc_tool.py -C
+```
+
+`--clear-cache` / `-C` 只清理工具缓存，不删除题目目录里的 `libc_dir`。清理范围包括：
+
+- pwntools cache 下的 `libc_tool_extra_libs`
+- `libcdb_libs`
+- `libcdb_dbg`
+- `libcdb`
+- `LIBC_INDEX_CACHE`
+
+## Debug 和运行库
+
+debug 包里的 libc 可能是 debug-only ELF，没有 `.dynamic`，不能直接作为运行时 `libc.so.6`。工具现在会：
+
+- 要求运行时 `libc.so.6` 必须有 `.dynamic`
+- debug-only 文件另存为 `*.debug`
+- 优先用 `eu-unstrip` 把 debug 符号合并到可运行 libc
+- 已合并 debug 符号的 libc 不会再被源 libc 覆盖
+- 即使 debug 符号获取失败，也会继续补齐 `DT_NEEDED` 依赖
+
+本地运行旧 libc 程序时推荐用 loader 直接验证依赖解析：
+
+```bash
+./libc_dir/ld-linux-x86-64.so.2 --library-path ./libc_dir:. --list ./pwn
+```
+
+patch:
+
+```bash
+patchelf --set-interpreter "$PWD/libc_dir/ld-linux-x86-64.so.2" ./pwn
+patchelf --force-rpath --set-rpath '$ORIGIN/libc_dir:$ORIGIN' ./pwn
+```
+

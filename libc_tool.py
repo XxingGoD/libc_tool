@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
+ORIGINAL_ARGV = sys.argv[1:]
 PWN_IMPORT_ERROR = None
 try:
     from pwn import *
@@ -80,6 +81,14 @@ COMMON_LIBC_SYMBOLS = [
     'open',
     'execve',
 ]
+
+MATCH_TYPE_RANK = {
+    'exact_sha1': 50,
+    'exact': 40,
+    'symbol_address': 30,
+    'partial': 20,
+    'version': 10,
+}
 
 UBUNTU_GLIBC_MAP = {
     "16.04": "2.23", "16.10": "2.24", "17.04": "2.25", "17.10": "2.26",
@@ -160,8 +169,21 @@ DEBIAN_GCC_RELEASE_MAP = {
 }
 
 SONAME_PACKAGE_HINTS = {
+    "libgcc_s.so.1": ["libgcc1", "libgcc-s1"],
+    "libstdc++.so.6": ["libstdc++6"],
     "libseccomp.so.2": ["libseccomp2"],
 }
+
+ABI_VERSION_PREFIXES_BY_SONAME = {
+    "libstdc++.so.6": ("GLIBCXX_", "CXXABI_"),
+    "libgcc_s.so.1": ("GCC_",),
+}
+
+ABI_VERSION_TOKEN_RE = re.compile(
+    r'\b(?:GLIBCXX|CXXABI|GCC)_[0-9][A-Za-z0-9_.]*\b'
+    r'|\bGLIBC_(?:[0-9][A-Za-z0-9_.]*|ABI_[A-Za-z0-9_]+)\b'
+)
+GLIBC_RUNTIME_PREFIXES = ('GLIBC_',)
 
 ANSI_CODES = {
     "reset": "\033[0m",
@@ -263,6 +285,68 @@ def ensure_pwntools_cache_dir():
         if context.cache_dir:
             return context.cache_dir
     return None
+
+def libc_tool_cache_targets():
+    targets = []
+    cache_dir = ensure_pwntools_cache_dir()
+    if cache_dir:
+        for name in ('libc_tool_extra_libs', 'libcdb_libs', 'libcdb_dbg', 'libcdb'):
+            targets.append(os.path.join(cache_dir, name))
+    targets.append(LIBC_INDEX_CACHE)
+    return list(dict.fromkeys(targets))
+
+def path_size(path):
+    if not os.path.exists(path):
+        return 0
+    if os.path.isfile(path) or os.path.islink(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for file_name in files:
+            file_path = os.path.join(root, file_name)
+            try:
+                total += os.path.getsize(file_path)
+            except OSError:
+                pass
+    return total
+
+def format_bytes(size):
+    value = float(size)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if value < 1024 or unit == 'GB':
+            if unit == 'B':
+                return f"{int(value)}{unit}"
+            return f"{value:.2f}{unit}"
+        value /= 1024
+    return f"{value:.2f}GB"
+
+def clear_libc_tool_cache():
+    removed = []
+    skipped = []
+    total_size = 0
+    for target in libc_tool_cache_targets():
+        if not os.path.exists(target):
+            skipped.append(target)
+            continue
+        size = path_size(target)
+        try:
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target)
+            else:
+                os.unlink(target)
+        except OSError as e:
+            log.warning(f"清理缓存失败: {stderr_path(target)} ({e})")
+            continue
+        total_size += size
+        removed.append((target, size))
+    return {
+        'removed': removed,
+        'skipped': skipped,
+        'bytes': total_size,
+    }
 
 def readelf_env():
     env = os.environ.copy()
@@ -520,13 +604,248 @@ def get_directory_entry_names(target_dir):
 def has_named_artifact(target_dir, name):
     return name in get_directory_entry_names(target_dir)
 
+def abi_version_prefixes_for_soname(soname):
+    return ABI_VERSION_PREFIXES_BY_SONAME.get(soname, ())
+
+def abi_version_sort_key(token):
+    prefix, _sep, version = str(token).partition('_')
+    parts = []
+    for part in re.findall(r'\d+|[A-Za-z]+|[^A-Za-z\d]+', version):
+        if part.isdigit():
+            parts.append((0, int(part)))
+        else:
+            parts.append((1, part))
+    return prefix, tuple(parts)
+
+def extract_abi_version_tokens(text_value, prefixes=None):
+    prefixes = tuple(prefixes or ())
+    tokens = set(ABI_VERSION_TOKEN_RE.findall(text_value or ''))
+    if prefixes:
+        tokens = {token for token in tokens if token.startswith(prefixes)}
+    return tokens
+
+def parse_version_needs_by_file(readelf_version_output):
+    needs = {}
+    current_file = None
+    for line in (readelf_version_output or '').splitlines():
+        file_match = re.search(r'\bFile:\s+(\S+)', line)
+        if file_match:
+            current_file = file_match.group(1)
+            needs.setdefault(current_file, set())
+        if not current_file:
+            continue
+        for token in extract_abi_version_tokens(line):
+            needs.setdefault(current_file, set()).add(token)
+    return needs
+
+def get_required_abi_versions_by_soname(elf_path):
+    if not elf_path or not os.path.exists(elf_path):
+        return {}
+    analysis = cached_file_analysis(elf_path)
+    needs_by_file = parse_version_needs_by_file(analysis.get('readelf_version', ''))
+    result = {}
+    fallback_text = "\n".join((
+        analysis.get('readelf_version', ''),
+        analysis.get('objdump_t', ''),
+    ))
+    for soname, prefixes in ABI_VERSION_PREFIXES_BY_SONAME.items():
+        required = set()
+        for needed_file, tokens in needs_by_file.items():
+            if needed_file == soname:
+                required.update(token for token in tokens if token.startswith(prefixes))
+        if not required:
+            required.update(extract_abi_version_tokens(fallback_text, prefixes=prefixes))
+        if required:
+            result[soname] = required
+    return result
+
+def get_required_abi_versions_for_soname(elf_path, soname):
+    prefixes = abi_version_prefixes_for_soname(soname)
+    if not prefixes:
+        return set()
+    return set(get_required_abi_versions_by_soname(elf_path).get(soname, set()))
+
+def get_provided_abi_versions(library_path, soname=None):
+    prefixes = abi_version_prefixes_for_soname(soname) if soname else None
+    if not library_path or not os.path.exists(library_path):
+        return set()
+    analysis = cached_file_analysis(library_path)
+    text_value = "\n".join((
+        analysis.get('readelf_version', ''),
+        analysis.get('strings', ''),
+        analysis.get('objdump_t', ''),
+    ))
+    return extract_abi_version_tokens(text_value, prefixes=prefixes)
+
+def get_required_versions_from_needed_file(elf_path, needed_file, prefixes=None):
+    if not elf_path or not os.path.exists(elf_path):
+        return set()
+    needs_by_file = parse_version_needs_by_file(
+        cached_file_analysis(elf_path).get('readelf_version', '')
+    )
+    return extract_abi_version_tokens(
+        "\n".join(sorted(needs_by_file.get(needed_file, set()))),
+        prefixes=prefixes,
+    )
+
+def get_required_libc_runtime_versions(library_path):
+    return get_required_versions_from_needed_file(
+        library_path,
+        'libc.so.6',
+        prefixes=GLIBC_RUNTIME_PREFIXES,
+    )
+
+def get_provided_libc_runtime_versions(libc_path):
+    if not libc_path or not os.path.exists(libc_path):
+        return set()
+    analysis = cached_file_analysis(libc_path)
+    provided = set()
+    provided.update(extract_abi_version_tokens(
+        analysis.get('strings', ''),
+        prefixes=GLIBC_RUNTIME_PREFIXES,
+    ))
+    provided.update(extract_abi_version_tokens(
+        analysis.get('readelf_version', ''),
+        prefixes=GLIBC_RUNTIME_PREFIXES,
+    ))
+    provided.update(extract_abi_version_tokens(
+        analysis.get('objdump_t', ''),
+        prefixes=GLIBC_RUNTIME_PREFIXES,
+    ))
+    return provided
+
+def check_library_libc_runtime_compatibility(library_path, runtime_libc_path):
+    if not library_path or not os.path.exists(library_path):
+        return {
+            'ok': False,
+            'reason': 'missing',
+            'required': set(),
+            'provided': set(),
+            'missing': set(),
+        }
+    if not runtime_libc_path or not os.path.exists(runtime_libc_path):
+        return {
+            'ok': False,
+            'reason': 'runtime_libc_missing',
+            'required': set(),
+            'provided': set(),
+            'missing': set(),
+        }
+    required = get_required_libc_runtime_versions(library_path)
+    if not required:
+        return {
+            'ok': True,
+            'reason': 'no_runtime_version_requirement',
+            'required': required,
+            'provided': set(),
+            'missing': set(),
+        }
+    provided = get_provided_libc_runtime_versions(runtime_libc_path)
+    missing = required - provided
+    return {
+        'ok': not missing,
+        'reason': 'ok' if not missing else 'missing_runtime_versions',
+        'required': required,
+        'provided': provided,
+        'missing': missing,
+    }
+
+def summarize_abi_versions(tokens, limit=4):
+    ordered = sorted(tokens or (), key=abi_version_sort_key)
+    if not ordered:
+        return '-'
+    if len(ordered) <= limit:
+        return ', '.join(ordered)
+    head = ', '.join(ordered[:limit])
+    return f"{head}, ... ({len(ordered)} 个)"
+
+def find_library_artifact(root_dir, soname, require_dynamic=False):
+    if not root_dir or not soname or not os.path.isdir(root_dir):
+        return None
+    candidates = []
+    for root, _dirs, files in os.walk(root_dir):
+        for file_name in sorted(files):
+            if file_name == soname:
+                priority = 0
+            elif file_name.startswith(soname + '.'):
+                priority = 1
+            else:
+                continue
+            candidate = os.path.join(root, file_name)
+            if not os.path.isfile(candidate):
+                continue
+            if require_dynamic and is_elf_file(candidate) and not elf_has_dynamic_section(candidate):
+                continue
+            candidates.append((priority, len(file_name), candidate))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
+
+def check_library_abi_satisfaction(library_path, soname, required_versions=None):
+    required = set(required_versions or ())
+    if not library_path or not os.path.exists(library_path):
+        return {
+            'ok': False,
+            'reason': 'missing',
+            'required': required,
+            'provided': set(),
+            'missing': required,
+        }
+    if is_elf_file(library_path) and not elf_has_dynamic_section(library_path):
+        return {
+            'ok': False,
+            'reason': 'no_dynamic_section',
+            'required': required,
+            'provided': set(),
+            'missing': required,
+        }
+    if not required:
+        return {
+            'ok': True,
+            'reason': 'no_version_requirement',
+            'required': required,
+            'provided': set(),
+            'missing': set(),
+        }
+    provided = get_provided_abi_versions(library_path, soname=soname)
+    missing = required - provided
+    return {
+        'ok': not missing,
+        'reason': 'ok' if not missing else 'missing_versions',
+        'required': required,
+        'provided': provided,
+        'missing': missing,
+    }
+
+def library_satisfies_abi_requirements(library_path, soname, elf_path=None, required_versions=None):
+    if required_versions is None:
+        required_versions = get_required_abi_versions_for_soname(elf_path, soname)
+    return check_library_abi_satisfaction(library_path, soname, required_versions=required_versions)
+
+def library_satisfies_runtime_libc(library_path, runtime_libc_path):
+    return check_library_libc_runtime_compatibility(library_path, runtime_libc_path)
+
 def get_missing_needed_libraries(elf_path, target_dir, extra_needed=None):
     missing = []
     present_names = get_directory_entry_names(target_dir)
+    required_versions_by_soname = get_required_abi_versions_by_soname(elf_path)
+    runtime_libc_path = find_library_artifact(target_dir, 'libc.so.6', require_dynamic=True)
     for soname in get_requested_shared_libraries(elf_path, extra_needed=extra_needed):
         if soname == 'libc.so.6':
             continue
         if soname in present_names:
+            library_path = find_library_artifact(target_dir, soname)
+            status = library_satisfies_abi_requirements(
+                library_path,
+                soname,
+                required_versions=required_versions_by_soname.get(soname, set()),
+            )
+            if status['ok']:
+                runtime_status = library_satisfies_runtime_libc(library_path, runtime_libc_path)
+                if runtime_status['ok']:
+                    continue
+            missing.append(soname)
             continue
         missing.append(soname)
     return missing
@@ -754,6 +1073,7 @@ def cached_file_analysis(file_path):
             'objdump_t': '',
             'comment': '',
             'readelf_hn': '',
+            'readelf_version': '',
         }
     cache_key = (abs_path, stat_result.st_mtime_ns, stat_result.st_size)
     cached = FILE_ANALYSIS_CACHE.get(cache_key)
@@ -765,12 +1085,14 @@ def cached_file_analysis(file_path):
         'objdump_t': '',
         'comment': '',
         'readelf_hn': '',
+        'readelf_version': '',
     }
     commands = (
         ('strings', ['strings', abs_path], None, 20),
         ('objdump_t', ['objdump', '-T', abs_path], None, 15),
         ('comment', ['readelf', '-p', '.comment', abs_path], readelf_env(), 10),
         ('readelf_hn', ['readelf', '-h', '-n', abs_path], readelf_env(), 10),
+        ('readelf_version', ['readelf', '--version-info', abs_path], readelf_env(), 10),
     )
     for field, command, env, timeout in commands:
         try:
@@ -984,18 +1306,19 @@ def decode_debian_package_index(raw_data, index_url):
         return lzma.decompress(raw_data).decode(errors='ignore')
     return raw_data.decode(errors='ignore')
 
-def find_deb_package_url(package_names, distro, release, arch, package_version=None, package_filename=None):
+def iter_deb_package_urls(package_names, distro, release, arch, package_version=None, package_filename=None):
     if not package_names or not distro or not arch:
-        return None
+        return
     wanted = set(package_names)
-    exact_match_required = bool(package_version or package_filename)
+    package_order = {name: index for index, name in enumerate(package_names)}
     distro_label = 'Ubuntu' if distro == 'ubuntu' else 'Debian'
     if distro == 'ubuntu':
         index_iter = iter_ubuntu_package_indexes(release, arch)
     elif distro == 'debian':
         index_iter = iter_debian_package_indexes(release, arch)
     else:
-        return None
+        return
+    seen_urls = set()
     for repo_root, index_url in index_iter:
         try:
             raw_data = libcdb.wget(index_url, timeout=20)
@@ -1005,6 +1328,7 @@ def find_deb_package_url(package_names, distro, release, arch, package_version=N
         except Exception as e:
             log.warning(f"获取 {distro_label} 包索引失败: {index_url} ({e})")
             continue
+        entries = []
         for entry in iter_debian_control_entries(index_text):
             if entry.get('Package') not in wanted:
                 continue
@@ -1019,7 +1343,30 @@ def find_deb_package_url(package_names, distro, release, arch, package_version=N
             basename = os.path.basename(filename)
             if package_filename and basename != package_filename:
                 continue
-            return f"{repo_root}/{filename.lstrip('/')}"
+            package_name = entry.get('Package')
+            arch_score = 0 if entry_arch == arch else 1
+            entries.append((package_order.get(package_name, len(package_order)), arch_score, entry))
+        for _package_rank, _arch_score, entry in sorted(entries, key=lambda item: item[:2]):
+            filename = entry.get('Filename')
+            package_url = f"{repo_root}/{filename.lstrip('/')}"
+            if package_url in seen_urls:
+                continue
+            seen_urls.add(package_url)
+            yield package_url
+
+def find_deb_package_url(package_names, distro, release, arch, package_version=None, package_filename=None):
+    if not package_names or not distro or not arch:
+        return None
+    exact_match_required = bool(package_version or package_filename)
+    for package_url in iter_deb_package_urls(
+        package_names,
+        distro,
+        release,
+        arch,
+        package_version=package_version,
+        package_filename=package_filename,
+    ):
+        return package_url
     if exact_match_required:
         return None
     return None
@@ -1238,7 +1585,28 @@ def find_local_libc_database_url(libc_path):
         return None
     return re.sub(r'(?<!:)//+', '/', package_url)
 
-def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None, overwrite=False):
+def elf_has_dynamic_section(elf_path):
+    try:
+        result = subprocess.run(
+            ['readelf', '-d', elf_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=readelf_env(),
+        )
+    except Exception:
+        return False
+    output = (result.stdout or '') + (result.stderr or '')
+    return result.returncode == 0 and 'There is no dynamic section' not in output
+
+def copy_debug_only_artifact(source_file, target_file):
+    debug_target = target_file + '.debug'
+    if os.path.exists(debug_target):
+        return None
+    shutil.copy2(source_file, debug_target)
+    return debug_target
+
+def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None, overwrite=False, require_dynamic=False):
     os.makedirs(target_dir, exist_ok=True)
     copied = []
     seen = set()
@@ -1258,6 +1626,12 @@ def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None, over
             target_file = os.path.join(target_dir, file_name)
             if target_file in seen:
                 continue
+            if require_dynamic and is_elf_file(source_file) and not elf_has_dynamic_section(source_file):
+                debug_copy = copy_debug_only_artifact(source_file, target_file)
+                if debug_copy:
+                    copied.append(debug_copy)
+                seen.add(target_file)
+                continue
             if os.path.exists(target_file) and not overwrite:
                 seen.add(target_file)
                 continue
@@ -1265,6 +1639,83 @@ def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None, over
             copied.append(target_file)
             seen.add(target_file)
     return copied
+
+def runtime_libc_target_names(libc_path):
+    names = ['libc.so.6']
+    basename = os.path.basename(libc_path)
+    if re.fullmatch(r'libc-\d+(?:\.\d+)*\.so', basename):
+        names.append(basename)
+    else:
+        file_ver, _file_arch = parse_filename_id(basename)
+        if file_ver:
+            names.append(f'libc-{file_ver}.so')
+    return list(dict.fromkeys(names))
+
+def is_same_elf_build_id(left_path, right_path):
+    if not left_path or not right_path:
+        return False
+    if not os.path.exists(left_path) or not os.path.exists(right_path):
+        return False
+    if not is_elf_file(left_path) or not is_elf_file(right_path):
+        return False
+    left_build_id, _left_arch = inspect_elf_metadata(left_path)
+    right_build_id, _right_arch = inspect_elf_metadata(right_path)
+    return bool(left_build_id and right_build_id and left_build_id == right_build_id)
+
+def copy_runtime_libc(libc_path, target_dir, overwrite=False):
+    if not libc_path or not os.path.exists(libc_path):
+        return []
+    if not is_elf_file(libc_path) or not elf_has_dynamic_section(libc_path):
+        return []
+    copied = []
+    for name in runtime_libc_target_names(libc_path):
+        target_file = os.path.join(target_dir, name)
+        if os.path.exists(target_file) and is_elf_file(target_file) and not elf_has_dynamic_section(target_file):
+            copy_debug_only_artifact(target_file, target_file)
+        elif os.path.exists(target_file) and not overwrite:
+            if is_same_elf_build_id(target_file, libc_path) and elf_has_debug_symbols(target_file):
+                continue
+        shutil.copy2(libc_path, target_file)
+        copied.append(target_file)
+    return copied
+
+def safe_member_target_path(dest_root, member_name):
+    member_path = os.path.abspath(os.path.join(dest_root, member_name))
+    if not member_path.startswith(dest_root + os.sep) and member_path != dest_root:
+        raise ValueError(f"archive path escapes target dir: {member_name}")
+    return member_path
+
+def sanitize_tar_link_member(member, dest_root):
+    if not (member.issym() or member.islnk()):
+        return member
+    link_name = member.linkname or ''
+    if not link_name:
+        return member
+
+    member_path = safe_member_target_path(dest_root, member.name)
+    if os.path.isabs(link_name):
+        target_path = safe_member_target_path(dest_root, link_name.lstrip('/'))
+    else:
+        target_path = os.path.abspath(os.path.join(os.path.dirname(member_path), link_name))
+        if not target_path.startswith(dest_root + os.sep) and target_path != dest_root:
+            raise ValueError(f"archive link escapes target dir: {member.name} -> {link_name}")
+
+    if member.issym():
+        safe_link_name = os.path.relpath(target_path, os.path.dirname(member_path))
+    else:
+        safe_link_name = os.path.relpath(target_path, dest_root)
+    return member.replace(linkname=safe_link_name)
+
+def safe_extract_tar(tar_obj, dest_dir):
+    dest_root = os.path.abspath(dest_dir)
+    members = []
+    for member in tar_obj.getmembers():
+        safe_member_target_path(dest_root, member.name)
+        members.append(sanitize_tar_link_member(member, dest_root))
+    try:
+        tar_obj.extractall(dest_dir, members=members, filter='fully_trusted')
+    except TypeError:
+        tar_obj.extractall(dest_dir, members=members)
 
 def extract_all_from_deb_with_system_tools(cache_dir, package_filename, package_data):
     ar_path = shutil.which('ar')
@@ -1306,12 +1757,7 @@ def extract_all_from_deb_with_system_tools(cache_dir, package_filename, package_
                 raise RuntimeError(f"ar extract failed: {detail}")
             tar_path = os.path.join(unpack_dir, data_name)
             with tarfile.open(tar_path, mode='r:*') as tar_obj:
-                dest_root = os.path.abspath(cache_dir)
-                for member in tar_obj.getmembers():
-                    member_path = os.path.abspath(os.path.join(cache_dir, member.name))
-                    if not member_path.startswith(dest_root + os.sep) and member_path != dest_root:
-                        raise ValueError(f"archive path escapes target dir: {member.name}")
-                tar_obj.extractall(cache_dir)
+                safe_extract_tar(tar_obj, cache_dir)
             return
 
         result = subprocess.run(
@@ -1340,14 +1786,6 @@ def extract_all_from_deb(cache_dir, package_filename, package_data):
         return
     from io import BytesIO
 
-    def _safe_extract_all(tar_obj, dest_dir):
-        dest_root = os.path.abspath(dest_dir)
-        for member in tar_obj.getmembers():
-            member_path = os.path.abspath(os.path.join(dest_dir, member.name))
-            if not member_path.startswith(dest_root + os.sep) and member_path != dest_root:
-                raise ValueError(f"archive path escapes target dir: {member.name}")
-        tar_obj.extractall(dest_dir)
-
     ar_file = unix_ar.open(BytesIO(package_data))
     try:
         data_name = next(
@@ -1365,7 +1803,7 @@ def extract_all_from_deb(cache_dir, package_filename, package_data):
             tar_stream.close()
             tar_stream = decompressed
         with tarfile.open(fileobj=tar_stream, mode='r:*') as tar_obj:
-            _safe_extract_all(tar_obj, cache_dir)
+            safe_extract_tar(tar_obj, cache_dir)
     finally:
         ar_file.close()
 
@@ -1468,12 +1906,22 @@ def unstrip_libc_tree_with_debug_package(libc_dir, debug_dir):
         if elf_has_debug_symbols(debug_libc):
             for target_libc in find_libc_files_in_tree(libc_dir):
                 if os.path.basename(target_libc) == os.path.basename(debug_libc) or os.path.basename(target_libc) == 'libc.so.6':
-                    shutil.copy2(debug_libc, target_libc)
-                    log.success(
-                        f"debug 包提供完整未 strip libc: {stderr_path(target_libc)} "
-                        f"<- {stderr_path(debug_libc)}"
-                    )
-                    return True
+                    if elf_has_dynamic_section(debug_libc):
+                        shutil.copy2(debug_libc, target_libc)
+                        log.success(
+                            f"debug 包提供完整未 strip libc: {stderr_path(target_libc)} "
+                            f"<- {stderr_path(debug_libc)}"
+                        )
+                        return True
+                    if eu_unstrip_with_debug(target_libc, debug_libc):
+                        log.success(
+                            f"已合并 debug 符号: {stderr_path(target_libc)} "
+                            f"<- {stderr_path(debug_libc)}"
+                        )
+                        return True
+                    debug_copy = copy_debug_only_artifact(debug_libc, target_libc)
+                    if debug_copy:
+                        log.info(f"debug-only libc 已另存: {stderr_path(debug_copy)}")
     debug_files = find_debug_files_in_tree(debug_dir)
     if not debug_files:
         log.warning("debug 包中未找到可用 debug 文件")
@@ -1532,11 +1980,31 @@ def try_unstrip_libc_tree(libc_dir):
     if not libcdb or not hasattr(libcdb, 'unstrip_libc'):
         return None
     for candidate in find_libc_files_in_tree(libc_dir):
+        if not elf_has_dynamic_section(candidate):
+            continue
+        backup_path = candidate + '.runtime.bak'
         try:
+            shutil.copy2(candidate, backup_path)
             if libcdb.unstrip_libc(candidate):
-                return candidate
+                if elf_has_dynamic_section(candidate):
+                    if elf_has_debug_symbols(candidate):
+                        return candidate
+                else:
+                    copy_debug_only_artifact(candidate, candidate)
+                    shutil.copy2(backup_path, candidate)
         except Exception as e:
             log.debug(f"libc unstrip 失败: {candidate} ({e})")
+            if os.path.exists(backup_path):
+                try:
+                    shutil.copy2(backup_path, candidate)
+                except OSError:
+                    pass
+        finally:
+            if os.path.exists(backup_path):
+                try:
+                    os.unlink(backup_path)
+                except OSError:
+                    pass
     return None
 
 def download_matching_ubuntu_libc_package(libc_path):
@@ -1650,24 +2118,60 @@ def find_unstripped_libc_in_dir(target_dir):
             return libc_file
     return None
 
-def find_repository_package_url(package_names, distro, release, arch, package_version=None, package_filename=None):
-    if distro == 'ubuntu':
-        return find_ubuntu_package_url(
-            package_names,
-            release,
-            arch,
-            package_version=package_version,
-            package_filename=package_filename,
-        )
-    if distro == 'debian':
-        return find_debian_package_url(
-            package_names,
-            release,
-            arch,
-            package_version=package_version,
-            package_filename=package_filename,
-        )
+def find_libc_debug_symbol_file_in_dir(target_dir):
+    for libc_file in sorted(find_libc_files_in_tree(target_dir)):
+        debug_file = libc_file + '.debug'
+        if os.path.exists(debug_file) and elf_has_debug_symbols(debug_file):
+            return debug_file
     return None
+
+def iter_repository_package_urls(package_names, distro, release, arch, package_version=None, package_filename=None):
+    if distro == 'ubuntu':
+        yield from iter_deb_package_urls(
+            package_names,
+            'ubuntu',
+            release,
+            normalize_deb_arch_name(arch),
+            package_version=package_version,
+            package_filename=package_filename,
+        )
+        return
+    if distro == 'debian':
+        yield from iter_deb_package_urls(
+            package_names,
+            'debian',
+            release,
+            normalize_deb_arch_name(arch),
+            package_version=package_version,
+            package_filename=package_filename,
+        )
+
+def find_repository_package_url(package_names, distro, release, arch, package_version=None, package_filename=None):
+    return next(
+        iter_repository_package_urls(
+            package_names,
+            distro,
+            release,
+            arch,
+            package_version=package_version,
+            package_filename=package_filename,
+        ),
+        None,
+    )
+
+def describe_library_abi_status(status):
+    reason = status.get('reason')
+    if reason == 'missing':
+        return '未找到目标库文件'
+    if reason == 'no_dynamic_section':
+        return '目标库没有 dynamic section'
+    if reason == 'missing_versions':
+        return f"缺少版本: {summarize_abi_versions(status.get('missing', set()))}"
+    if reason == 'runtime_libc_missing':
+        return '目标运行时 libc 不存在'
+    if reason == 'missing_runtime_versions':
+        return f"依赖的 libc 版本不存在: {summarize_abi_versions(status.get('missing', set()))}"
+    return reason or '未知原因'
 
 def format_download_context(distro, release, arch):
     label = 'Ubuntu' if distro == 'ubuntu' else 'Debian'
@@ -1718,7 +2222,7 @@ def download_extra_packages(libc_path, target_dir, extra_packages=None):
         extracted_dir = download_and_extract_deb_package(package_url, cache_key)
         if not extracted_dir:
             continue
-        copied_now = copy_shared_object_artifacts(extracted_dir, target_dir)
+        copied_now = copy_shared_object_artifacts(extracted_dir, target_dir, require_dynamic=True)
         if copied_now:
             copied.extend(copied_now)
             copied_targets = ", ".join(stderr_path(path) for path in copied_now)
@@ -1744,26 +2248,66 @@ def download_missing_dependencies(libc_path, elf_path, target_dir, missing=None,
         f"检查额外依赖: 目标 {stderr_version(format_download_context(distro, release, arch))}, "
         f"缺失 {stderr_number(len(missing))} 个"
     )
+    required_versions_by_soname = get_required_abi_versions_by_soname(elf_path)
+    runtime_libc_path = find_library_artifact(target_dir, 'libc.so.6', require_dynamic=True)
     for soname in missing:
         package_names = guess_package_names_from_soname_with_hints(soname, package_hints=package_hints)
         if not package_names:
             log.warning(f"无法推断 {stderr_name(soname)} 对应的 Debian/Ubuntu 包")
             continue
-        package_url = find_repository_package_url(package_names, distro, release, arch)
-        if not package_url:
+        required_versions = required_versions_by_soname.get(soname, set())
+        if required_versions:
+            log.info(
+                f"{stderr_name(soname)} 需要 ABI 版本: "
+                f"{stderr_version(summarize_abi_versions(required_versions))}"
+            )
+
+        attempted = False
+        satisfied = False
+        for package_url in iter_repository_package_urls(package_names, distro, release, arch):
+            attempted = True
+            cache_key = hashlib.sha256(package_url.encode()).hexdigest()[:16]
+            extracted_dir = download_and_extract_deb_package(package_url, cache_key)
+            if not extracted_dir:
+                continue
+            candidate_lib = find_library_artifact(extracted_dir, soname, require_dynamic=True)
+            status = library_satisfies_abi_requirements(
+                candidate_lib,
+                soname,
+                required_versions=required_versions,
+            )
+            if not status['ok']:
+                log.info(
+                    f"跳过 {stderr_name(soname)} 候选包 {stderr_path(package_url)}: "
+                    f"{describe_library_abi_status(status)}"
+                )
+                continue
+            runtime_status = library_satisfies_runtime_libc(candidate_lib, runtime_libc_path)
+            if not runtime_status['ok']:
+                log.info(
+                    f"跳过 {stderr_name(soname)} 候选包 {stderr_path(package_url)}: "
+                    f"{describe_library_abi_status(runtime_status)}"
+                )
+                continue
+            copied_now = copy_shared_object_artifacts(
+                extracted_dir,
+                target_dir,
+                wanted_names={soname},
+                overwrite=True,
+                require_dynamic=True,
+            )
+            if copied_now:
+                copied.extend(copied_now)
+                copied_targets = ", ".join(stderr_path(path) for path in copied_now)
+                log.success(f"补全依赖 {stderr_name(soname)} 来自 {stderr_path(package_url)} -> {copied_targets}")
+            else:
+                log.warning(f"已下载 {stderr_name(soname)} 对应包，但未复制目标库文件")
+            satisfied = True
+            break
+        if not attempted:
             log.warning(f"未找到 {stderr_name(soname)} 的 Debian/Ubuntu 包（候选: {', '.join(package_names)}）")
-            continue
-        cache_key = hashlib.sha256(package_url.encode()).hexdigest()[:16]
-        extracted_dir = download_and_extract_deb_package(package_url, cache_key)
-        if not extracted_dir:
-            continue
-        copied_now = copy_shared_object_artifacts(extracted_dir, target_dir, wanted_names={soname})
-        if copied_now:
-            copied.extend(copied_now)
-            copied_targets = ", ".join(stderr_path(path) for path in copied_now)
-            log.success(f"补全依赖 {stderr_name(soname)} 来自 {stderr_path(package_url)} -> {copied_targets}")
-        else:
-            log.warning(f"已下载 {stderr_name(soname)} 对应包，但未找到目标库文件")
+        elif not satisfied:
+            log.warning(f"未找到满足版本要求的 {stderr_name(soname)} 包（候选: {', '.join(package_names)}）")
     return copied
 
 def load_index_cache():
@@ -2078,7 +2622,30 @@ def extract_release_tag(name):
     match = re.search(r'_(\d+\.\d+(?:\.\d+)?)-([^_]+)', name)
     return match.group(2) if match else ""
 
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def version_sort_key(value):
+    if not value or value == 'unknown':
+        return ()
+    match = re.match(r'(\d+(?:\.\d+)*)', str(value))
+    if not match:
+        return ()
+    return version_tuple(match.group(1))
+
+def extract_numbered_variant(name):
+    stem = name[:-3] if name.endswith('.so') else name
+    match = re.search(r'_(\d+)$', stem)
+    return int(match.group(1)) if match else 0
+
+def primary_variant_score(name):
+    return 1 if extract_numbered_variant(name) == 0 else 0
+
 def preferred_arch_package_score(name, target_arch):
+    target_arch = normalize_arch_name(target_arch)
     if target_arch == 'unknown':
         return 0
     stem = name[:-3] if name.endswith('.so') else name
@@ -2089,6 +2656,40 @@ def preferred_arch_package_score(name, target_arch):
     if stem.endswith(f'_{target_arch}') or re.search(rf'_{re.escape(target_arch)}_\d+$', stem):
         return 1
     return 0
+
+def preferred_distro_package_score(name, info, target_ubuntu=None, target_debian=None):
+    text_value = f"{name} {info}".lower()
+    has_ubuntu = 'ubuntu' in text_value
+    has_debian = 'debian' in text_value or '+deb' in text_value
+
+    if target_ubuntu:
+        if has_ubuntu:
+            return 2
+        if has_debian:
+            return -2
+    if target_debian:
+        debian_codename = normalize_debian_release(target_debian)
+        debian_version_tag = f"+deb{target_debian}".lower()
+        if debian_version_tag in text_value:
+            return 4
+        if debian_codename and debian_codename in text_value:
+            return 4
+        if has_debian:
+            return 2
+        if has_ubuntu:
+            return -2
+    return 0
+
+def match_types_for(match):
+    match_types = match.get('match_types')
+    if isinstance(match_types, list):
+        return [item for item in match_types if item]
+    match_type = match.get('match_type')
+    return [match_type] if match_type else []
+
+def match_type_rank(match):
+    ranks = [MATCH_TYPE_RANK.get(match_type, 0) for match_type in match_types_for(match)]
+    return max(ranks, default=0)
 
 def natural_sort_key(value):
     parts = re.findall(r'\d+|[A-Za-z]+|[^A-Za-z\d]+', value)
@@ -2101,6 +2702,82 @@ def normalize_candidate_family(name):
     stem = name[:-3] if name.endswith('.so') else name
     stem = re.sub(r'_2$', '', stem)
     return stem
+
+def libc_candidate_sort_key(match, target_arch='unknown'):
+    name = match.get('name', '')
+    return (
+        safe_int(match.get('score')),
+        match_type_rank(match),
+        safe_int(match.get('evidence_count'), 1),
+        safe_int(match.get('arch_score'), preferred_arch_package_score(name, target_arch)),
+        safe_int(match.get('version_match_rank')),
+        safe_int(match.get('distro_score')),
+        safe_int(match.get('matched_symbol_count')),
+        safe_int(match.get('symbol_count')),
+        version_sort_key(match.get('glibc_ver')),
+        natural_sort_key(extract_release_tag(name)),
+        primary_variant_score(name),
+    )
+
+def merge_reason(existing_reason, new_reason):
+    merged = []
+    seen = set()
+    for reason in (existing_reason, new_reason):
+        for part in str(reason or '').split(', '):
+            part = part.strip()
+            if not part or part in seen:
+                continue
+            merged.append(part)
+            seen.add(part)
+    return ', '.join(merged)
+
+def merge_match_types(existing, incoming):
+    merged = []
+    seen = set()
+    for match_type in match_types_for(existing) + match_types_for(incoming):
+        if match_type in seen:
+            continue
+        merged.append(match_type)
+        seen.add(match_type)
+    return merged
+
+def merge_duplicate_matches(matches):
+    by_path = {}
+    for match in matches:
+        path = match.get('path')
+        if not path:
+            continue
+        current = by_path.get(path)
+        if current is None:
+            current = dict(match)
+            current['match_types'] = match_types_for(match)
+            current['evidence_count'] = len(current['match_types']) or 1
+            by_path[path] = current
+            continue
+
+        current['reason'] = merge_reason(current.get('reason'), match.get('reason'))
+        current['match_types'] = merge_match_types(current, match)
+        current['evidence_count'] = len(current['match_types']) or 1
+
+        if safe_int(match.get('score')) > safe_int(current.get('score')):
+            current['score'] = match.get('score')
+        if match_type_rank(match) > match_type_rank(current):
+            current['match_type'] = match.get('match_type')
+
+        for key in (
+            'symbol_count',
+            'matched_symbol_count',
+            'version_match_rank',
+            'distro_score',
+            'arch_score',
+        ):
+            current[key] = max(safe_int(current.get(key)), safe_int(match.get(key)))
+
+        for key in ('glibc_ver', 'arch', 'info', 'name'):
+            if not current.get(key) or current.get(key) == 'unknown':
+                current[key] = match.get(key, current.get(key))
+
+    return list(by_path.values())
 
 def deduplicate_candidates(matches):
     grouped = {}
@@ -2476,7 +3153,7 @@ def find_by_version_cached(version_info, index, target_arch):
             candidate_ids.update(index.get('by_id', {}).keys())
 
     matches = []
-    for entry_id in candidate_ids:
+    for entry_id in sorted(candidate_ids):
         entry = get_entry_by_id(index, entry_id)
         if not entry:
             continue
@@ -2488,20 +3165,25 @@ def find_by_version_cached(version_info, index, target_arch):
         match_reason = []
         score += 100
         match_reason.append("potential_match")
+        version_match_rank = 0
 
         file_ver = entry.get('version')
         sym_count = symbol_count(entry)
         if file_ver and target_glibc:
             if file_ver == target_glibc:
                 score += 200
+                version_match_rank = 3
                 match_reason.append(f"exact_glibc_{file_ver}")
             elif file_ver.startswith(target_glibc + '.'):
                 score += 150
+                version_match_rank = 2
                 match_reason.append(f"prefix_glibc_{file_ver}")
             elif target_glibc.startswith(file_ver + '.'):
                 score += 50
+                version_match_rank = 1
                 match_reason.append(f"parent_glibc_{file_ver}")
 
+        distro_score = 0
         if target_ubuntu:
             ubuntu_tag = target_ubuntu.replace('.', '')
             entry_id = entry.get('id', '')
@@ -2524,19 +3206,41 @@ def find_by_version_cached(version_info, index, target_arch):
             score += 10
             match_reason.append(f"symbols_{sym_count}")
 
+        distro_score = preferred_distro_package_score(
+            entry.get('id', ''),
+            entry.get('info', ''),
+            target_ubuntu=target_ubuntu,
+            target_debian=target_debian,
+        )
+        if distro_score:
+            score += distro_score
+            if distro_score > 0:
+                match_reason.append(
+                    f"{'ubuntu' if target_ubuntu else 'debian'}_preferred"
+                )
+            else:
+                match_reason.append(
+                    f"{'debian' if target_ubuntu else 'ubuntu'}_preferred"
+                )
+
         if score > 100:
+            name = os.path.basename(entry['path'])
             matches.append({
                 'path': entry['path'],
-                'name': os.path.basename(entry['path']),
+                'name': name,
+                'match_type': 'version',
                 'score': score,
                 'reason': ', '.join(match_reason),
                 'glibc_ver': file_ver or 'unknown',
                 'arch': entry_arch,
                 'info': entry.get('info', ''),
                 'symbol_count': sym_count,
+                'version_match_rank': version_match_rank,
+                'distro_score': distro_score,
+                'arch_score': preferred_arch_package_score(name, target_arch),
             })
 
-    matches.sort(key=lambda x: x['score'], reverse=True)
+    matches.sort(key=lambda x: libc_candidate_sort_key(x, target_arch), reverse=True)
     return matches
 
 def find_by_symbol_address(elf_path, index, target_arch=None):
@@ -2588,13 +3292,14 @@ def find_by_symbol_address(elf_path, index, target_arch=None):
         return []
 
     matches = []
-    for entry_id in candidates:
+    for entry_id in sorted(candidates):
         entry = get_entry_by_id(index, entry_id)
         if not entry:
             continue
+        name = os.path.basename(entry['path'])
         matches.append({
             'path': entry['path'],
-            'name': os.path.basename(entry['path']),
+            'name': name,
             'match_type': 'symbol_address',
             'score': 4000,
             'reason': f'symbol_address_match ({len(symbol_constraints)} symbols)',
@@ -2602,6 +3307,8 @@ def find_by_symbol_address(elf_path, index, target_arch=None):
             'arch': entry.get('arch', 'unknown'),
             'info': entry.get('info', ''),
             'symbol_count': symbol_count(entry),
+            'matched_symbol_count': len(symbol_constraints),
+            'arch_score': preferred_arch_package_score(name, target_arch),
         })
 
     return matches
@@ -2661,29 +3368,12 @@ def auto_find_libc(elf_path, candidate_limit=20, group_variants=True):
         log.error("未找到匹配的 libc")
         return []
 
-    seen = set()
-    unique_matches = []
-    for m in all_matches:
-        if m['path'] not in seen:
-            seen.add(m['path'])
-            unique_matches.append(m)
-
+    unique_matches = merge_duplicate_matches(all_matches)
     unique_matches.sort(key=lambda m: m.get('path', ''))
-
-    def sort_key(m):
-        score = m.get('score', 0)
-        if m.get('match_type') == 'exact':
-            score += 1000
-        elif m.get('match_type') == 'exact_sha1':
-            score += 2000
-        return (
-            score,
-            m.get('symbol_count', 0),
-            preferred_arch_package_score(m.get('name', ''), arch),
-            natural_sort_key(extract_release_tag(m.get('name', ''))),
-        )
-
-    unique_matches.sort(key=sort_key, reverse=True)
+    unique_matches.sort(
+        key=lambda m: libc_candidate_sort_key(m, arch),
+        reverse=True,
+    )
     if group_variants:
         ranked_matches = deduplicate_candidates(unique_matches)
     else:
@@ -2752,19 +3442,27 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
         libc_dir,
         target_dir,
         overwrite=bool(find_unstripped_libc_in_dir(libc_dir)),
+        require_dynamic=True,
     )
+    copied_files.extend(copy_runtime_libc(libc_path, target_dir, overwrite=False))
     log.info(f"libc 下载目录 : {stderr_path(libc_dir)}")
     log.info(f"libc 输出目录 : {stderr_path(target_dir)}")
     if copied_files:
         log.info(f"本次新增文件 : {stderr_number(len(copied_files))} 个")
     else:
         log.info("目标目录已存在下载的 libc 文件，本次没有新增复制")
+    runtime_libc = os.path.join(target_dir, 'libc.so.6')
+    if not os.path.exists(runtime_libc) or not elf_has_dynamic_section(runtime_libc):
+        log.failure(f"运行时 libc 不可加载: {stderr_path(runtime_libc)}")
+        return None
     unstripped_libc = find_unstripped_libc_in_dir(target_dir)
+    debug_symbol_file = find_libc_debug_symbol_file_in_dir(target_dir)
     if unstripped_libc:
         log.success(f"未 strip libc : {stderr_path(unstripped_libc)}")
+    elif debug_symbol_file:
+        log.success(f"libc debug 符号 : {stderr_path(debug_symbol_file)}")
     else:
-        log.failure("未能获得带符号的 libc；普通 libc6 包通常是 stripped，需要可用的 libc6-dbg/libc6-dbgsym 或 debuginfod")
-        return None
+        log.warning("未能获得带符号的 libc；普通 libc6 包通常是 stripped，需要可用的 libc6-dbg/libc6-dbgsym 或 debuginfod")
     extra_package_copied = []
     if extra_packages:
         log.info(
@@ -2884,7 +3582,8 @@ def main():
     parser.add_argument('--doctor', action='store_true', help='只执行环境自检')
     parser.add_argument('--output-dir', default=None, help='指定下载输出目录，默认使用输入文件所在目录下的 libc_dir')
     parser.add_argument('--rebuild-index', action='store_true', help='重建索引缓存')
-    args = parser.parse_args()
+    parser.add_argument('--clear-cache', '-C', action='store_true', help='清理 libc_tool/pwntools 下载缓存和 libc 索引缓存')
+    args = parser.parse_args(ORIGINAL_ARGV)
 
     if args.doctor:
         report = run_doctor()
@@ -2902,6 +3601,16 @@ def main():
 
     if args.candidate_limit is not None and args.candidate_limit < 0:
         parser.error('--candidate-limit 必须大于等于 0')
+
+    if args.clear_cache:
+        result = clear_libc_tool_cache()
+        for path, size in result['removed']:
+            log.success(f"已清理缓存: {stderr_path(path)} ({stderr_number(format_bytes(size))})")
+        if not result['removed']:
+            log.info("没有可清理的缓存")
+        else:
+            log.success(f"缓存清理完成，释放 {stderr_number(format_bytes(result['bytes']))}")
+        return
 
     if PWN_IMPORT_ERROR is not None:
         exit_missing_pwntools()
