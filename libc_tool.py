@@ -198,6 +198,9 @@ ANSI_CODES = {
     "cyan": "\033[36m",
 }
 
+PATCH_BACKUP_SUFFIX = '.bak'
+PATCH_SCHEMA_VERSION = 1
+
 def stream_supports_color(stream):
     if os.environ.get("NO_COLOR") is not None:
         return False
@@ -948,6 +951,388 @@ def command_check(name):
     path = shutil.which(name)
     return bool(path), path
 
+def require_command(name, feature=None):
+    ok, path = command_check(name)
+    if ok:
+        return path
+    feature_text = f" for {feature}" if feature else ""
+    raise RuntimeError(f"missing required command{feature_text}: {name}")
+
+def loader_name_candidates_for_arch(arch):
+    arch = normalize_arch_name(arch)
+    if arch == 'amd64':
+        return ['ld-linux-x86-64.so.2', 'ld-linux.so.2']
+    if arch == 'i386':
+        return ['ld-linux.so.2']
+    if arch == 'aarch64':
+        return ['ld-linux-aarch64.so.1']
+    if arch == 'arm':
+        return ['ld-linux-armhf.so.3', 'ld-linux.so.3']
+    if arch == 'x32':
+        return ['ld-linux-x32.so.2', 'ld-linux-x86-64.so.2']
+    return []
+
+def is_loader_artifact_name(name):
+    basename = os.path.basename(name)
+    return (
+        basename == 'ld.so'
+        or basename.startswith('ld-linux')
+        or re.fullmatch(r'ld-\d+(?:\.\d+)*\.so(?:\.[^/]+)*', basename) is not None
+    )
+
+def iter_patchable_shared_objects(target_dir):
+    if not target_dir or not os.path.isdir(target_dir):
+        return []
+    patchable = []
+    seen = set()
+    for root, _dirs, files in os.walk(target_dir):
+        for file_name in sorted(files):
+            if not is_shared_object_artifact(file_name):
+                continue
+            if is_loader_artifact_name(file_name):
+                continue
+            file_path = os.path.join(root, file_name)
+            if file_path in seen or not os.path.isfile(file_path):
+                continue
+            if not is_elf_file(file_path) or not elf_has_dynamic_section(file_path):
+                continue
+            patchable.append(file_path)
+            seen.add(file_path)
+    return patchable
+
+def resolve_runtime_loader(target_dir, elf_path):
+    if not target_dir or not os.path.isdir(target_dir):
+        return None
+    arch = get_elf_arch(elf_path)
+    for loader_name in loader_name_candidates_for_arch(arch):
+        loader_path = find_library_artifact(target_dir, loader_name, require_dynamic=True)
+        if loader_path:
+            return loader_path
+    fallback = []
+    for root, _dirs, files in os.walk(target_dir):
+        for file_name in sorted(files):
+            if not is_loader_artifact_name(file_name):
+                continue
+            file_path = os.path.join(root, file_name)
+            if not os.path.isfile(file_path):
+                continue
+            if is_elf_file(file_path) and not elf_has_dynamic_section(file_path):
+                continue
+            fallback.append(file_path)
+    return sorted(fallback)[0] if fallback else None
+
+def origin_relative_path(from_dir, to_path):
+    rel_path = os.path.relpath(os.path.abspath(to_path), os.path.abspath(from_dir))
+    rel_path = rel_path.replace(os.sep, '/')
+    if rel_path == '.':
+        return '$ORIGIN'
+    return f"$ORIGIN/{rel_path}"
+
+def compute_main_rpath(elf_path, target_dir):
+    elf_dir = os.path.dirname(os.path.abspath(elf_path))
+    entries = [origin_relative_path(elf_dir, target_dir), '$ORIGIN']
+    deduped = []
+    for entry in entries:
+        if entry not in deduped:
+            deduped.append(entry)
+    return ':'.join(deduped)
+
+def format_patch_transition(before, after, formatter=None, missing='-'):
+    formatter = formatter or (lambda value: value)
+    before_text = missing if before in (None, '') else before
+    after_text = missing if after in (None, '') else after
+    return f"{formatter(before_text)} -> {formatter(after_text)}"
+
+def get_patch_backup_path(elf_path):
+    return os.path.abspath(elf_path) + PATCH_BACKUP_SUFFIX
+
+def sha256_of_file(file_path):
+    h = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def get_program_interpreter(elf_path):
+    if not elf_path or not os.path.exists(elf_path) or not is_elf_file(elf_path):
+        return None
+    try:
+        result = subprocess.run(
+            ['readelf', '-l', elf_path],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=readelf_env(),
+        )
+    except Exception:
+        return None
+    output = (result.stdout or '') + (result.stderr or '')
+    match = re.search(r'Requesting program interpreter:\s*([^\]]+)', output)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+def get_dynamic_search_paths(elf_path):
+    result = {
+        'rpath': None,
+        'runpath': None,
+        'effective': None,
+    }
+    if not elf_path or not os.path.exists(elf_path) or not is_elf_file(elf_path):
+        return result
+    try:
+        proc = subprocess.run(
+            ['readelf', '-d', elf_path],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=readelf_env(),
+        )
+    except Exception:
+        return result
+    output = (proc.stdout or '') + (proc.stderr or '')
+    runpath_match = re.search(r'\(RUNPATH\).*Library runpath: \[(.*?)\]', output)
+    rpath_match = re.search(r'\(RPATH\).*Library rpath: \[(.*?)\]', output)
+    if rpath_match:
+        result['rpath'] = rpath_match.group(1)
+    if runpath_match:
+        result['runpath'] = runpath_match.group(1)
+    result['effective'] = result['runpath'] or result['rpath']
+    return result
+
+def snapshot_patch_target_state(elf_path):
+    paths = get_dynamic_search_paths(elf_path)
+    return {
+        'path': os.path.abspath(elf_path),
+        'sha256': sha256_of_file(elf_path),
+        'build_id': build_id_from_elf(elf_path),
+        'interpreter': get_program_interpreter(elf_path),
+        'rpath': paths.get('rpath'),
+        'runpath': paths.get('runpath'),
+        'effective_rpath': paths.get('effective'),
+    }
+
+def backup_patch_target(elf_path):
+    elf_path = os.path.abspath(elf_path)
+    backup_path = get_patch_backup_path(elf_path)
+    if os.path.exists(backup_path):
+        log.info(f"复用已有 patch 备份: {stderr_path(backup_path)}")
+        return backup_path
+    shutil.copy2(elf_path, backup_path)
+    log.info(f"创建 patch 备份: {stderr_path(backup_path)}")
+    return backup_path
+
+def restore_patched_elf(elf_path):
+    elf_path = os.path.abspath(elf_path)
+    backup_path = get_patch_backup_path(elf_path)
+    if not os.path.exists(backup_path):
+        raise RuntimeError(f"patch backup not found: {backup_path}")
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(elf_path) + '.restore.',
+        suffix='.tmp',
+        dir=os.path.dirname(elf_path),
+    )
+    os.close(fd)
+    try:
+        shutil.copy2(backup_path, tmp_path)
+        os.replace(tmp_path, elf_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    os.unlink(backup_path)
+    return elf_path
+
+def build_patch_plan(elf_path, target_dir, mode='rpath', extra_needed=None):
+    elf_path = os.path.abspath(elf_path)
+    target_dir = os.path.abspath(target_dir)
+    if mode not in ('rpath', 'replace-needed'):
+        raise RuntimeError(f"unsupported patch mode: {mode}")
+    if not os.path.exists(elf_path):
+        raise RuntimeError(f"ELF not found: {elf_path}")
+    if not is_elf_file(elf_path):
+        raise RuntimeError(f"target is not an ELF: {elf_path}")
+    if not os.path.isdir(target_dir):
+        raise RuntimeError(f"runtime directory not found: {target_dir}")
+    loader_path = resolve_runtime_loader(target_dir, elf_path)
+    if not loader_path:
+        raise RuntimeError(f"runtime loader not found in {target_dir}")
+    missing = get_missing_needed_libraries(elf_path, target_dir, extra_needed=extra_needed)
+    if missing:
+        raise RuntimeError(
+            "runtime directory still misses required libraries: " + ", ".join(sorted(missing))
+        )
+    replace_needed = []
+    if mode == 'replace-needed':
+        for soname in get_needed_shared_libraries(elf_path):
+            if is_loader_artifact_name(soname):
+                continue
+            resolved = find_library_artifact(target_dir, soname, require_dynamic=True)
+            if resolved:
+                replace_needed.append((soname, resolved))
+    source_libc = find_library_artifact(target_dir, 'libc.so.6', require_dynamic=True)
+    if not source_libc:
+        raise RuntimeError(f"runtime libc not found in {target_dir}")
+    return {
+        'schema_version': PATCH_SCHEMA_VERSION,
+        'elf_path': elf_path,
+        'target_dir': target_dir,
+        'mode': mode,
+        'loader_path': loader_path,
+        'main_rpath': compute_main_rpath(elf_path, target_dir),
+        'library_rpath': '$ORIGIN',
+        'replace_needed': replace_needed,
+        'patch_libraries': iter_patchable_shared_objects(target_dir),
+        'backup_path': get_patch_backup_path(elf_path),
+        'source_libc': source_libc,
+        'source_build_id': build_id_from_elf(source_libc),
+        'source_sha256': sha256_of_file(source_libc),
+    }
+
+def files_share_identity(path_a, path_b):
+    if not path_a or not path_b:
+        return False
+    try:
+        return os.path.samefile(path_a, path_b)
+    except OSError:
+        return os.path.abspath(path_a) == os.path.abspath(path_b)
+
+def inspect_runtime_dir_for_patch(target_dir, elf_path, extra_needed=None):
+    target_dir = os.path.abspath(target_dir)
+    result = {
+        'ok': False,
+        'reason': None,
+        'target_dir': target_dir,
+        'runtime_libc': None,
+        'loader_path': None,
+        'missing_libraries': [],
+    }
+    if not os.path.isdir(target_dir):
+        result['reason'] = 'dir_missing'
+        return result
+    runtime_libc = find_library_artifact(target_dir, 'libc.so.6', require_dynamic=True)
+    if not runtime_libc:
+        result['reason'] = 'libc_missing'
+        return result
+    result['runtime_libc'] = runtime_libc
+    loader_path = resolve_runtime_loader(target_dir, elf_path)
+    if not loader_path:
+        result['reason'] = 'loader_missing'
+        return result
+    result['loader_path'] = loader_path
+    missing_libraries = get_missing_needed_libraries(
+        elf_path,
+        target_dir,
+        extra_needed=extra_needed,
+    )
+    if missing_libraries:
+        result['reason'] = 'libraries_missing'
+        result['missing_libraries'] = sorted(missing_libraries)
+        return result
+    result['ok'] = True
+    result['reason'] = 'ok'
+    return result
+
+def inspect_local_runtime_dir_for_libc(libc_path, elf_path, extra_needed=None):
+    libc_path = os.path.abspath(libc_path)
+    result = inspect_runtime_dir_for_patch(
+        os.path.dirname(libc_path),
+        elf_path,
+        extra_needed=extra_needed,
+    )
+    result['provided_libc_path'] = libc_path
+    runtime_libc = result.get('runtime_libc')
+    if runtime_libc and not files_share_identity(runtime_libc, libc_path):
+        result['ok'] = False
+        result['reason'] = 'libc_mismatch'
+    return result
+
+def format_runtime_probe_failure(result):
+    reason = (result or {}).get('reason')
+    if reason == 'dir_missing':
+        return '运行库目录不存在'
+    if reason == 'libc_missing':
+        return '同目录未找到可用的 libc.so.6'
+    if reason == 'loader_missing':
+        return '同目录未找到匹配的 loader'
+    if reason == 'libraries_missing':
+        missing = ', '.join((result or {}).get('missing_libraries') or ())
+        return f"同目录仍缺少依赖: {missing}"
+    if reason == 'libc_mismatch':
+        return '给定 libc 与目录内实际用于 patch 的 libc.so.6 不一致'
+    return '本地运行库不完整'
+
+def run_patchelf(args):
+    require_command('patchelf', feature='patching ELF')
+    try:
+        result = subprocess.run(
+            ['patchelf'] + list(args),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as e:
+        raise RuntimeError(f"failed to execute patchelf: {e}") from e
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or '').strip()
+        raise RuntimeError(f"patchelf {' '.join(args)} failed: {detail or 'unknown error'}")
+    return result.stdout
+
+def apply_patch_plan(plan):
+    for library_path in plan.get('patch_libraries', ()):
+        run_patchelf(['--force-rpath', '--set-rpath', plan['library_rpath'], library_path])
+    main_path = plan.get('staged_elf_path', plan['elf_path'])
+    run_patchelf(['--set-interpreter', plan['loader_path'], main_path])
+    if plan['mode'] == 'rpath':
+        run_patchelf(['--force-rpath', '--set-rpath', plan['main_rpath'], main_path])
+    else:
+        for soname, resolved_path in plan.get('replace_needed', ()):
+            run_patchelf(['--replace-needed', soname, resolved_path, main_path])
+    return main_path
+
+def verify_patch_plan(plan):
+    main_path = plan.get('staged_elf_path', plan['elf_path'])
+    loader_path = plan['loader_path']
+    library_path = ':'.join([
+        plan['target_dir'],
+        os.path.dirname(main_path),
+    ])
+    result = subprocess.run(
+        [loader_path, '--library-path', library_path, '--list', main_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or '').strip()
+        raise RuntimeError(f"loader verification failed: {detail or 'unknown error'}")
+    return result.stdout
+
+def patch_elf_with_runtime_dir(elf_path, target_dir, mode='rpath', verify=True, extra_needed=None):
+    elf_path = os.path.abspath(elf_path)
+    plan = build_patch_plan(elf_path, target_dir, mode=mode, extra_needed=extra_needed)
+    backup_path = backup_patch_target(elf_path)
+    original_state = snapshot_patch_target_state(backup_path)
+    fd, staged_path = tempfile.mkstemp(
+        prefix=os.path.basename(elf_path) + '.patch.',
+        suffix='.tmp',
+        dir=os.path.dirname(elf_path),
+    )
+    os.close(fd)
+    try:
+        shutil.copy2(backup_path, staged_path)
+        plan['staged_elf_path'] = staged_path
+        apply_patch_plan(plan)
+        if verify:
+            verify_patch_plan(plan)
+        os.replace(staged_path, elf_path)
+    finally:
+        if os.path.exists(staged_path):
+            os.unlink(staged_path)
+    patched_state = snapshot_patch_target_state(elf_path)
+    plan['original_state'] = original_state
+    plan['patched_state'] = patched_state
+    return plan
+
 def tcp_probe(host, port, timeout=3):
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -1004,6 +1389,14 @@ def run_doctor():
             'ok' if ok else 'error',
             path or '未找到',
         )
+    ok, path = command_check('patchelf')
+    append_doctor_check(
+        checks,
+        'command:patchelf',
+        'ok' if ok else 'warning',
+        path or '未找到（仅 --patch/--restore 需要）',
+        required=False,
+    )
 
     db_exists = os.path.isdir(LIBC_DB_PATH)
     db_entries = 0
@@ -3725,189 +4118,354 @@ def exit_missing_pwntools():
     log.failure(message)
     sys.exit(1)
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='自动查找、下载和设置 libc')
-    parser.add_argument('file', nargs='?', default=None, help='ELF 文件或 libc 文件路径')
-    parser.add_argument('--elf', dest='reference_elf', default=None, help='显式指定要补全依赖的目标 ELF')
-    parser.add_argument('--extra-needed', action='append', default=None, help='手动追加要检查/补全的共享库 soname，可重复指定')
-    parser.add_argument('--extra-package', action='append', default=None, help='手动追加要下载的 Debian/Ubuntu 包名，可重复指定')
-    parser.add_argument('--package-hint', action='append', default=None, help='手动指定 soname 到 Debian/Ubuntu 包名候选映射，例如 libssl.so.1.1=libssl1.1')
-    parser.add_argument('--all-variants', action='store_true', help='显示并可选择所有 libc 子版本，不按家族合并')
-    parser.add_argument('--candidate-limit', type=int, default=20, help='候选 libc 显示/可选上限，默认 20，传 0 表示不限制')
-    parser.add_argument('--download', '-d', action='store_true', help='直接从给出的 libc 文件下载调试信息（跳过查找和交互）')
-    parser.add_argument('--doctor', action='store_true', help='只执行环境自检')
-    parser.add_argument('--output-dir', default=None, help='指定下载输出目录，默认使用输入文件所在目录下的 libc_dir')
-    parser.add_argument('--rebuild-index', action='store_true', help='重建索引缓存')
-    parser.add_argument('--clear-cache', '-C', action='store_true', help='清理 libc_tool/pwntools 下载缓存和 libc 索引缓存')
-    parser.add_argument('--core-info', action='store_true', help='显示 Rust core 加速后端状态')
-    args = parser.parse_args(ORIGINAL_ARGV)
-
-    if args.core_info:
-        core_path = find_rust_core_binary()
-        if core_path:
-            log.success(f"Rust core: {stderr_path(core_path)}")
-        else:
-            log.warning("Rust core 未找到，将使用纯 Python 回退")
-        return
-
-    if args.doctor:
-        report = run_doctor()
-        print_doctor_report(report)
-        if not report['ok']:
-            sys.exit(1)
-        return
-
-    try:
-        extra_needed = normalize_soname_list(args.extra_needed)
-        extra_packages = normalize_package_name_list(args.extra_package)
-        package_hints = parse_package_hint_specs(args.package_hint)
-    except ValueError as e:
-        parser.error(str(e))
-
-    if args.candidate_limit is not None and args.candidate_limit < 0:
-        parser.error('--candidate-limit 必须大于等于 0')
-
-    if args.clear_cache:
-        result = clear_libc_tool_cache()
-        for path, size in result['removed']:
-            log.success(f"已清理缓存: {stderr_path(path)} ({stderr_number(format_bytes(size))})")
-        if not result['removed']:
-            log.info("没有可清理的缓存")
-        else:
-            log.success(f"缓存清理完成，释放 {stderr_number(format_bytes(result['bytes']))}")
-        return
-
+def ensure_pwntools_loaded():
     if PWN_IMPORT_ERROR is not None:
         exit_missing_pwntools()
 
-    if args.rebuild_index:
-        log.info("重建索引缓存...")
-        if not rebuild_index_cache(force=True, quiet=False):
-            sys.exit(1)
-        log.success("索引缓存已重建")
-        return
+def normalize_cli_dependency_options(args, parser):
+    try:
+        extra_needed = normalize_soname_list(getattr(args, 'extra_needed', None))
+        extra_packages = normalize_package_name_list(getattr(args, 'extra_package', None))
+        package_hints = parse_package_hint_specs(getattr(args, 'package_hint', None))
+    except ValueError as e:
+        parser.error(str(e))
+    return extra_needed, extra_packages, package_hints
 
-    args.file, auto_libc_candidates = auto_resolve_input_file(args.file, args.reference_elf)
-    auto_require_input = bool(args.reference_elf or extra_needed or extra_packages)
-    if not args.file and auto_require_input:
-        if auto_libc_candidates:
-            log.failure(
-                "未能自动确定 libc 文件，请显式传入；候选: " +
-                ", ".join(stderr_path(path) for path in auto_libc_candidates)
-            )
+def validate_candidate_limit(args, parser):
+    candidate_limit = getattr(args, 'candidate_limit', None)
+    if candidate_limit is not None and candidate_limit < 0:
+        parser.error('--candidate-limit 必须大于等于 0')
+
+def require_existing_file(path, description):
+    file_path = os.path.abspath(path)
+    if not os.path.exists(file_path):
+        log.error(f"{description}不存在: {stderr_path(file_path)}")
+        sys.exit(1)
+    return file_path
+
+def require_existing_elf(path, description):
+    file_path = require_existing_file(path, description)
+    if not is_elf_file(file_path):
+        log.error(f"{description}不是有效 ELF: {stderr_path(file_path)}")
+        sys.exit(1)
+    return file_path
+
+def log_patch_completion(target_elf, plan):
+    log.success(
+        f"Patch 完成: {stderr_path(target_elf)} "
+        f"(mode={stderr_choice(plan['mode'])}, loader={stderr_path(plan['loader_path'])})"
+    )
+    log.info(
+        "  interpreter: " + format_patch_transition(
+            plan['original_state'].get('interpreter'),
+            plan['patched_state'].get('interpreter'),
+            formatter=stderr_path,
+        )
+    )
+    log.info(
+        "  rpath/runpath: " + format_patch_transition(
+            plan['original_state'].get('effective_rpath'),
+            plan['patched_state'].get('effective_rpath'),
+            formatter=lambda value: stderr_style(value, 'yellow'),
+        )
+    )
+
+def choose_libc_candidate_for_elf(elf_path, args):
+    matches = auto_find_libc(
+        elf_path,
+        candidate_limit=args.candidate_limit,
+        group_variants=not args.all_variants,
+    )
+    if not matches:
+        sys.exit(1)
+
+    selected_match = matches[0]
+    if getattr(args, 'yes', False):
+        if len(matches) > 1:
+            log.info(f"使用 --yes，自动选择推荐 libc: {stderr_name(selected_match['name'])}")
         else:
-            log.failure("未找到可用的 libc 文件，请显式传入")
-        sys.exit(1)
-
-    if not args.file:
-        parser.print_help()
-        return
-
-    if auto_libc_candidates and args.file:
-        log.info(f"自动使用 libc: {stderr_path(args.file)}")
-
-    if not os.path.exists(args.file):
-        log.error(f"文件不存在: {stderr_path(args.file)}")
-        sys.exit(1)
-
-    if args.reference_elf and not os.path.exists(args.reference_elf):
-        log.error(f"指定的 ELF 不存在: {stderr_path(args.reference_elf)}")
-        sys.exit(1)
-
-    if args.reference_elf and not is_elf_file(args.reference_elf):
-        log.error(f"指定的目标不是有效 ELF: {stderr_path(args.reference_elf)}")
-        sys.exit(1)
-
-    if args.download:
-        reference_elf = resolve_reference_elf_arg(args.file, args.reference_elf)
-        target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(args.file, reference_elf)
-        log.info(f"直接从 {stderr_path(args.file)} 下载 libc 调试信息...")
-        download_and_setup_libc(
-            args.file,
-            elf_path=reference_elf,
-            target_dir=target_dir,
-            extra_needed=extra_needed,
-            package_hints=package_hints,
-            extra_packages=extra_packages,
-        )
-        return
-
-    file_kind = 'libc' if is_libc_family_name(args.file) else ('elf' if is_elf_file(args.file) else 'libc')
-    reference_elf = resolve_reference_elf_arg(args.file, args.reference_elf)
-    target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(args.file, reference_elf)
-
-    if file_kind == 'elf':
-        log.info("检测到 ELF 文件，开始查找匹配的 libc...")
-        matches = auto_find_libc(
-            args.file,
-            candidate_limit=args.candidate_limit,
-            group_variants=not args.all_variants,
-        )
-        if not matches:
-            sys.exit(1)
-
-        selected_index = 0
-        selected_match = matches[0]
-        try:
-            if len(matches) > 1:
-                choice = prompt_input(f"\n请选择要使用的 libc (0-{len(matches)-1})，默认 0，输入 q 退出。").strip()
-            else:
-                choice = prompt_input(f"\n找到 1 个匹配: {selected_match['name']}。回车确认，或输入 q 退出。").strip()
-
-            if choice and choice.lower() == 'q':
-                log.info("已取消操作")
-                return
-
-            if choice and len(matches) > 1:
-                idx = int(choice)
-                if 0 <= idx < len(matches):
-                    selected_index = idx
-                    selected_match = matches[selected_index]
-                else:
-                    log.warning(f"索引 {stderr_number(idx)} 超出范围，使用默认推荐")
-        except ValueError:
-            log.warning("无效输入，使用默认推荐")
-        except EOFError:
-            log.info("已取消操作")
-            return
-
-        libc_path = selected_match['path']
-    else:
-        log.info("使用提供的 libc 文件...")
-        libc_path = args.file
-        if extra_needed:
-            log.info(
-                "手动追加依赖 : " +
-                ", ".join(stderr_name(name) for name in extra_needed)
-            )
-        if extra_packages:
-            log.info(
-                "手动追加包 : " +
-                ", ".join(stderr_name(name) for name in extra_packages)
-            )
-        if not reference_elf and not extra_packages:
-            log.warning("未自动关联到目标 ELF，额外依赖补全不会执行；可使用 --elf 显式指定")
+            log.info(f"使用 --yes，自动确认唯一匹配: {stderr_name(selected_match['name'])}")
+        return selected_match['path']
 
     try:
-        do_dl = prompt_input("\n下载 libc 调试信息？默认 Y，输入 n 跳过，输入 q 退出。").lower().strip()
-        if do_dl == 'q':
-            log.info("已取消操作")
-            return
-        do_dl = do_dl != 'n'
-    except EOFError:
-        do_dl = True
+        if len(matches) > 1:
+            choice = prompt_input(
+                f"\n请选择要使用的 libc (0-{len(matches)-1})，默认 0，输入 q 退出。"
+            ).strip()
+        else:
+            choice = prompt_input(
+                f"\n找到 1 个匹配: {selected_match['name']}。回车确认，或输入 q 退出。"
+            ).strip()
 
-    if do_dl:
-        log.info("开始下载 libc 调试信息...")
-        download_and_setup_libc(
+        if choice and choice.lower() == 'q':
+            log.info("已取消操作")
+            return None
+
+        if choice and len(matches) > 1:
+            idx = int(choice)
+            if 0 <= idx < len(matches):
+                selected_match = matches[idx]
+            else:
+                log.warning(f"索引 {stderr_number(idx)} 超出范围，使用默认推荐")
+    except ValueError:
+        log.warning("无效输入，使用默认推荐")
+    except EOFError:
+        log.info("已取消操作")
+        return None
+
+    return selected_match['path']
+
+def run_core_info_command(_args, _parser):
+    core_path = find_rust_core_binary()
+    if core_path:
+        log.success(f"Rust core: {stderr_path(core_path)}")
+    else:
+        log.warning("Rust core 未找到，将使用纯 Python 回退")
+
+def run_doctor_command(_args, _parser):
+    report = run_doctor()
+    print_doctor_report(report)
+    if not report['ok']:
+        sys.exit(1)
+
+def run_clear_cache_command(_args, _parser):
+    result = clear_libc_tool_cache()
+    for path, size in result['removed']:
+        log.success(f"已清理缓存: {stderr_path(path)} ({stderr_number(format_bytes(size))})")
+    if not result['removed']:
+        log.info("没有可清理的缓存")
+    else:
+        log.success(f"缓存清理完成，释放 {stderr_number(format_bytes(result['bytes']))}")
+
+def run_rebuild_index_command(_args, _parser):
+    ensure_pwntools_loaded()
+    log.info("重建索引缓存...")
+    if not rebuild_index_cache(force=True, quiet=False):
+        sys.exit(1)
+    log.success("索引缓存已重建")
+
+def run_find_command(args, parser):
+    ensure_pwntools_loaded()
+    validate_candidate_limit(args, parser)
+    target_elf = require_existing_elf(args.elf, '目标 ELF ')
+    auto_find_libc(
+        target_elf,
+        candidate_limit=args.candidate_limit,
+        group_variants=not args.all_variants,
+    )
+
+def run_download_command(args, parser):
+    ensure_pwntools_loaded()
+    validate_candidate_limit(args, parser)
+    extra_needed, extra_packages, package_hints = normalize_cli_dependency_options(args, parser)
+
+    input_file = os.path.abspath(args.file)
+    reference_elf = None
+    if args.elf:
+        reference_elf = require_existing_elf(args.elf, '指定的目标 ELF ')
+
+    if not os.path.exists(input_file):
+        log.error(f"文件不存在: {stderr_path(input_file)}")
+        sys.exit(1)
+
+    if is_elf_file(input_file) and not is_libc_family_name(input_file):
+        reference_elf = input_file
+        log.info("检测到 ELF 文件，开始查找匹配的 libc...")
+        libc_path = choose_libc_candidate_for_elf(input_file, args)
+        if not libc_path:
+            return
+    else:
+        libc_path = input_file
+        reference_elf = reference_elf or resolve_reference_elf_arg(libc_path, None)
+        log.info(f"直接从 {stderr_path(libc_path)} 下载 libc 调试信息...")
+
+    target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(input_file, reference_elf)
+    log.info("开始下载 libc 调试信息...")
+    prepared_dir = download_and_setup_libc(
+        libc_path,
+        elf_path=reference_elf,
+        target_dir=target_dir,
+        extra_needed=extra_needed,
+        package_hints=package_hints,
+        extra_packages=extra_packages,
+    )
+    if not prepared_dir:
+        sys.exit(1)
+
+def run_patch_command(args, parser):
+    validate_candidate_limit(args, parser)
+    extra_needed, extra_packages, package_hints = normalize_cli_dependency_options(args, parser)
+    target_elf = require_existing_elf(args.elf, '目标 ELF ')
+
+    if args.dir and args.libc:
+        parser.error('--dir 不能与 --libc 同时使用')
+    if args.dir and extra_packages:
+        parser.error('--dir 模式不支持 --extra-package，因为不会触发下载')
+
+    if args.dir:
+        patch_dir = os.path.abspath(args.dir)
+        if not os.path.isdir(patch_dir):
+            log.error(f"运行库目录不存在: {stderr_path(patch_dir)}")
+            sys.exit(1)
+        try:
+            plan = patch_elf_with_runtime_dir(
+                target_elf,
+                patch_dir,
+                mode=args.patch_mode,
+                verify=not args.no_verify,
+                extra_needed=extra_needed,
+            )
+        except RuntimeError as e:
+            log.failure(str(e))
+            sys.exit(1)
+        log_patch_completion(target_elf, plan)
+        return
+
+    ensure_pwntools_loaded()
+
+    if args.libc:
+        libc_path = require_existing_file(args.libc, 'libc 文件')
+        log.info(f"使用提供的 libc 文件: {stderr_path(libc_path)}")
+        local_runtime = inspect_local_runtime_dir_for_libc(
             libc_path,
-            elf_path=reference_elf,
-            target_dir=target_dir,
+            target_elf,
             extra_needed=extra_needed,
-            package_hints=package_hints,
-            extra_packages=extra_packages,
         )
+        if local_runtime['ok']:
+            log.info(f"检测到本地完整运行库，直接 patch: {stderr_path(local_runtime['target_dir'])}")
+            try:
+                plan = patch_elf_with_runtime_dir(
+                    target_elf,
+                    local_runtime['target_dir'],
+                    mode=args.patch_mode,
+                    verify=not args.no_verify,
+                    extra_needed=extra_needed,
+                )
+            except RuntimeError as e:
+                log.failure(str(e))
+                sys.exit(1)
+            log_patch_completion(target_elf, plan)
+            return
+        log.info(
+            "本地运行库不可直接 patch，回退到下载流程: "
+            + format_runtime_probe_failure(local_runtime)
+        )
+    else:
+        log.info("检测到 ELF 文件，开始查找匹配的 libc...")
+        libc_path = choose_libc_candidate_for_elf(target_elf, args)
+        if not libc_path:
+            return
+
+    target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(libc_path, target_elf)
+    log.info("开始下载 libc 调试信息...")
+    prepared_dir = download_and_setup_libc(
+        libc_path,
+        elf_path=target_elf,
+        target_dir=target_dir,
+        extra_needed=extra_needed,
+        package_hints=package_hints,
+        extra_packages=extra_packages,
+    )
+    if not prepared_dir:
+        sys.exit(1)
+
+    try:
+        plan = patch_elf_with_runtime_dir(
+            target_elf,
+            prepared_dir,
+            mode=args.patch_mode,
+            verify=not args.no_verify,
+            extra_needed=extra_needed,
+        )
+    except RuntimeError as e:
+        log.failure(str(e))
+        sys.exit(1)
+    log_patch_completion(target_elf, plan)
+
+def run_restore_command(args, _parser):
+    target_elf = require_existing_elf(args.elf, '目标 ELF ')
+    try:
+        restored = restore_patched_elf(target_elf)
+    except RuntimeError as e:
+        log.failure(str(e))
+        sys.exit(1)
+    log.success(f"已恢复 ELF: {stderr_path(restored)}")
+
+def add_dependency_args(parser):
+    parser.add_argument('--extra-needed', action='append', default=None, help='手动追加要检查/补全的共享库 soname，可重复指定')
+    parser.add_argument('--extra-package', action='append', default=None, help='手动追加要下载的 Debian/Ubuntu 包名，可重复指定')
+    parser.add_argument('--package-hint', action='append', default=None, help='手动指定 soname 到 Debian/Ubuntu 包名候选映射，例如 libssl.so.1.1=libssl1.1')
+
+def add_candidate_args(parser):
+    parser.add_argument('--all-variants', action='store_true', help='显示并可选择所有 libc 子版本，不按家族合并')
+    parser.add_argument('--candidate-limit', type=int, default=20, help='候选 libc 显示/可选上限，默认 20，传 0 表示不限制')
+    parser.add_argument('--yes', '-y', action='store_true', help='自动选择推荐候选并确认后续提示')
+
+def add_patch_behavior_args(parser):
+    parser.add_argument('--patch-mode', choices=('rpath', 'replace-needed'), default='rpath', help='patch 模式，默认 rpath')
+    parser.add_argument('--no-verify', action='store_true', help='patch 后不执行 loader --list 验证')
+
+def build_cli_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='自动查找、下载和设置 libc',
+        epilog='使用 `libc_tool <command> --help` 查看二级命令的详细选项。',
+    )
+    subparsers = parser.add_subparsers(dest='command', metavar='command')
+
+    find_parser = subparsers.add_parser('find', help='查找 ELF 的候选 libc')
+    find_parser.add_argument('elf', help='目标 ELF 路径')
+    add_candidate_args(find_parser)
+    find_parser.set_defaults(command_func=run_find_command)
+
+    download_parser = subparsers.add_parser('download', help='下载 libc 运行库或根据 ELF 自动匹配后下载')
+    download_parser.add_argument('file', help='libc 文件路径；如果传入 ELF，会先匹配候选 libc 再下载')
+    download_parser.add_argument('--elf', dest='elf', default=None, help='显式指定要补全依赖的目标 ELF')
+    download_parser.add_argument('--output-dir', default=None, help='指定下载输出目录，默认使用输入文件所在目录下的 libc_dir')
+    add_dependency_args(download_parser)
+    add_candidate_args(download_parser)
+    download_parser.set_defaults(command_func=run_download_command)
+
+    patch_parser = subparsers.add_parser('patch', help='patch 目标 ELF，可自动匹配/下载，或直接使用现有运行库')
+    patch_parser.add_argument('elf', help='目标 ELF 路径')
+    patch_parser.add_argument('--libc', default=None, help='显式指定 libc.so.6 文件；若同目录已有完整运行库则直接 patch，否则回退到下载')
+    patch_parser.add_argument('--dir', default=None, help='直接使用已有运行库目录 patch，不触发下载')
+    patch_parser.add_argument('--output-dir', default=None, help='指定下载输出目录，默认使用目标 ELF 同目录下的 libc_dir')
+    add_dependency_args(patch_parser)
+    add_candidate_args(patch_parser)
+    add_patch_behavior_args(patch_parser)
+    patch_parser.set_defaults(command_func=run_patch_command)
+
+    restore_parser = subparsers.add_parser('restore', help='从 .bak 恢复被 patch 的 ELF')
+    restore_parser.add_argument('elf', help='目标 ELF 路径')
+    restore_parser.set_defaults(command_func=run_restore_command)
+
+    doctor_parser = subparsers.add_parser('doctor', help='执行环境自检')
+    doctor_parser.set_defaults(command_func=run_doctor_command)
+
+    rebuild_parser = subparsers.add_parser('rebuild-index', help='重建 libc 索引缓存')
+    rebuild_parser.set_defaults(command_func=run_rebuild_index_command)
+
+    clear_parser = subparsers.add_parser('clear-cache', help='清理 libc_tool/pwntools 下载缓存和 libc 索引缓存')
+    clear_parser.set_defaults(command_func=run_clear_cache_command)
+
+    core_parser = subparsers.add_parser('core-info', help='显示 Rust core 加速后端状态')
+    core_parser.set_defaults(command_func=run_core_info_command)
+
+    return parser
+
+def main():
+    parser = build_cli_parser()
+    if not ORIGINAL_ARGV:
+        parser.print_help()
+        return
+    args = parser.parse_args(ORIGINAL_ARGV)
+    command_func = getattr(args, 'command_func', None)
+    if command_func is None:
+        parser.print_help()
+        return
+    command_func(args, parser)
 
 if __name__ == "__main__":
     main()

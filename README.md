@@ -119,13 +119,25 @@ python3 libc_tool.py --all-variants --candidate-limit 0 ./pwn
 查匹配：
 
 ```bash
-python3 libc_tool.py ./pwn
+python3 libc_tool.py find ./pwn
+```
+
+如果你只有一个 ELF，想自动选择推荐 libc 并继续后续下载流程，可以加 `-y`：
+
+```bash
+python3 libc_tool.py download -y ./pwn
+```
+
+如果你只有一个 ELF，并且希望自动完成“匹配 libc -> 下载运行库 -> patch ELF”，可以直接：
+
+```bash
+python3 libc_tool.py patch -y ./pwn
 ```
 
 直接下载某个 `libc` 的运行库：
 
 ```bash
-python3 libc_tool.py --download ./libc.so
+python3 libc_tool.py download ./libc.so
 ```
 
 `--download` 会尽量下载并合并未 strip 的 libc：先拿 `libc6` 包，再找对应的 `libc6-dbg` / `libc6-dbgsym` 或 debuginfod 符号。若最终输出目录中没有带 `.symtab` / `.debug_info` 的 libc，会返回失败，而不是静默接受 stripped libc。
@@ -133,7 +145,7 @@ python3 libc_tool.py --download ./libc.so
 下载运行库并补程序依赖：
 
 ```bash
-python3 libc_tool.py --download --elf ./pwn ./libc.so
+python3 libc_tool.py download --elf ./pwn ./libc.so
 ```
 
 如果目标 ELF 依赖 C++ 运行库，工具会从 ELF 的 version need 中提取并校验：
@@ -146,38 +158,72 @@ python3 libc_tool.py --download --elf ./pwn ./libc.so
 补一个额外库：
 
 ```bash
-python3 libc_tool.py --download --elf ./pwn --extra-needed libstdc++.so.6 ./libc.so
+python3 libc_tool.py download --elf ./pwn --extra-needed libstdc++.so.6 ./libc.so
 ```
 
 按包名补 Debian/Ubuntu 包：
 
 ```bash
-python3 libc_tool.py --download --extra-package libseccomp2 ./libc.so
+python3 libc_tool.py download --extra-package libseccomp2 ./libc.so
 ```
 
 手动指定 soname 到包名映射：
 
 ```bash
-python3 libc_tool.py --download --elf ./pwn --package-hint libssl.so.1.1=libssl1.1 ./libc.so
+python3 libc_tool.py download --elf ./pwn --package-hint libssl.so.1.1=libssl1.1 ./libc.so
 ```
 
 默认输出到输入文件同目录下的 `libc_dir`，也可以自己指定：
 
 ```bash
-python3 libc_tool.py --download --output-dir ./my_libs --elf ./pwn ./libc.so
+python3 libc_tool.py download --output-dir ./my_libs --elf ./pwn ./libc.so
+```
+
+下载完成后直接 patch 目标 ELF：
+
+```bash
+python3 libc_tool.py patch --elf ./pwn --libc ./libc.so
+```
+
+如果你本地已经有准备好的 `libc_dir`，不想再下载 libc，可以直接 patch：
+
+```bash
+python3 libc_tool.py patch --dir ./libc_dir ./pwn
+```
+
+如果你本地已经有 `libc.so.6`，并且它同目录下还有对应的 `ld-linux-x86-64.so.2` 以及目标 ELF 需要的其他运行库，也可以直接给 `--libc`，工具会优先尝试“本地直接 patch”，不够完整时才回退到下载流程：
+
+```bash
+python3 libc_tool.py patch -y --libc ./libc.so.6 ./pwn
+```
+
+默认 patch 模式是 `rpath`。如果你确实需要把主程序的 `DT_NEEDED` 绑定到 `libc_dir` 内的绝对路径，可以显式改成：
+
+```bash
+python3 libc_tool.py patch --libc ./libc.so --patch-mode replace-needed ./pwn
+```
+
+patch 时会：
+
+- 为目标 ELF 生成 `./pwn.bak`
+- 默认用目标 loader 执行 `--list` 做一次依赖解析验证
+
+恢复原始 ELF：
+
+```bash
+python3 libc_tool.py restore ./pwn
 ```
 
 重建 libc 索引缓存：
 
 ```bash
-python3 libc_tool.py --rebuild-index
+python3 libc_tool.py rebuild-index
 ```
 
 清理缓存：
 
 ```bash
-python3 libc_tool.py --clear-cache
-python3 libc_tool.py -C
+python3 libc_tool.py clear-cache
 ```
 
 `--clear-cache` / `-C` 只清理工具缓存，不删除题目目录里的 `libc_dir`。清理范围包括：
@@ -209,4 +255,10 @@ patch:
 ```bash
 patchelf --set-interpreter "$PWD/libc_dir/ld-linux-x86-64.so.2" ./pwn
 patchelf --force-rpath --set-rpath '$ORIGIN/libc_dir:$ORIGIN' ./pwn
+```
+
+如果使用 `--patch`，工具会自动做上面的 interpreter/RPATH 处理；仍建议在 patch 后自己再跑一次：
+
+```bash
+./libc_dir/ld-linux-x86-64.so.2 --library-path ./libc_dir:. --list ./pwn
 ```
