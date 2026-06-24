@@ -20,7 +20,7 @@
 检查：
 
 ```bash
-python3 libc_tool.py --doctor
+python3 libc_tool.py doctor
 ```
 
 ## Rust Core
@@ -48,7 +48,7 @@ Python 会按以下顺序查找 core：
 查看是否启用：
 
 ```bash
-python3 libc_tool.py --core-info
+python3 libc_tool.py core-info
 ```
 
 如果找不到 Rust core，工具自动回退到纯 Python 实现。
@@ -56,7 +56,7 @@ python3 libc_tool.py --core-info
 重建索引时如果 Rust core 可用，会优先走 Rust：
 
 ```bash
-python3 libc_tool.py --rebuild-index
+python3 libc_tool.py rebuild-index
 ```
 
 ## libc-database
@@ -111,7 +111,7 @@ LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
 默认只显示前 20 个候选。查看所有子版本或取消数量限制：
 
 ```bash
-python3 libc_tool.py --all-variants --candidate-limit 0 ./pwn
+python3 libc_tool.py find --all-variants --candidate-limit 0 ./pwn
 ```
 
 ## 常用命令
@@ -120,6 +120,32 @@ python3 libc_tool.py --all-variants --candidate-limit 0 ./pwn
 
 ```bash
 python3 libc_tool.py find ./pwn
+```
+
+二级命令支持两种简写：
+
+- 固定别名：长期稳定，推荐优先使用
+- 唯一前缀：当前能唯一命中时可直接调用
+
+固定别名：
+
+```bash
+python3 libc_tool.py f ./pwn
+python3 libc_tool.py dl ./libc.so
+python3 libc_tool.py pt -y ./pwn
+python3 libc_tool.py rs ./pwn
+python3 libc_tool.py do
+python3 libc_tool.py reb
+python3 libc_tool.py cc
+python3 libc_tool.py ci
+```
+
+唯一前缀示例：
+
+```bash
+python3 libc_tool.py pat -y ./pwn
+python3 libc_tool.py cle
+python3 libc_tool.py cor
 ```
 
 如果你只有一个 ELF，想自动选择推荐 libc 并继续后续下载流程，可以加 `-y`：

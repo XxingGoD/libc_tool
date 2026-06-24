@@ -4405,6 +4405,64 @@ def add_patch_behavior_args(parser):
     parser.add_argument('--patch-mode', choices=('rpath', 'replace-needed'), default='rpath', help='patch 模式，默认 rpath')
     parser.add_argument('--no-verify', action='store_true', help='patch 后不执行 loader --list 验证')
 
+def supported_cli_commands():
+    return [
+        'find',
+        'download',
+        'patch',
+        'restore',
+        'doctor',
+        'rebuild-index',
+        'clear-cache',
+        'core-info',
+    ]
+
+def supported_cli_command_aliases():
+    return {
+        'f': 'find',
+        'dl': 'download',
+        'dlo': 'download',
+        'pt': 'patch',
+        'p': 'patch',
+        'rs': 'restore',
+        'r': 'restore',
+        'dr': 'doctor',
+        'do': 'doctor',
+        'reb': 'rebuild-index',
+        'ri': 'rebuild-index',
+        'cc': 'clear-cache',
+        'ci': 'core-info',
+    }
+
+def resolve_cli_command_prefix(argv):
+    argv = list(argv or ())
+    if not argv:
+        return argv
+    head = argv[0]
+    if not head or head.startswith('-'):
+        return argv
+    commands = supported_cli_commands()
+    aliases = supported_cli_command_aliases()
+    if head in commands:
+        return argv
+    if head in aliases:
+        resolved = list(argv)
+        resolved[0] = aliases[head]
+        return resolved
+    matches = [command for command in commands if command.startswith(head)]
+    if len(matches) == 1:
+        resolved = list(argv)
+        resolved[0] = matches[0]
+        return resolved
+    if not matches:
+        return argv
+    log.failure(
+        "命令前缀有歧义: "
+        + f"{stderr_choice(head)} -> "
+        + ", ".join(stderr_choice(item) for item in matches)
+    )
+    sys.exit(1)
+
 def build_cli_parser():
     import argparse
 
@@ -4460,7 +4518,8 @@ def main():
     if not ORIGINAL_ARGV:
         parser.print_help()
         return
-    args = parser.parse_args(ORIGINAL_ARGV)
+    argv = resolve_cli_command_prefix(ORIGINAL_ARGV)
+    args = parser.parse_args(argv)
     command_func = getattr(args, 'command_func', None)
     if command_func is None:
         parser.print_help()
