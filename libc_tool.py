@@ -134,7 +134,8 @@ UBUNTU_GLIBC_MAP = {
     "18.04": "2.27", "18.10": "2.28", "19.04": "2.29", "19.10": "2.30",
     "20.04": "2.31", "20.10": "2.32", "21.04": "2.33", "21.10": "2.34",
     "22.04": "2.35", "22.10": "2.36", "23.04": "2.37", "23.10": "2.38",
-    "24.04": "2.39", "24.10": "2.40", "25.04": "2.41", "25.10": "2.42"
+    "24.04": "2.39", "24.10": "2.40", "25.04": "2.41", "25.10": "2.42",
+    "26.04": "2.43",
 }
 
 UBUNTU_CODENAME_MAP = {
@@ -143,6 +144,7 @@ UBUNTU_CODENAME_MAP = {
     "20.04": "focal", "20.10": "groovy", "21.04": "hirsute", "21.10": "impish",
     "22.04": "jammy", "22.10": "kinetic", "23.04": "lunar", "23.10": "mantic",
     "24.04": "noble", "24.10": "oracular", "25.04": "plucky", "25.10": "questing",
+    "26.04": "resolute", "26.10": "stonking",
 }
 
 DEBIAN_GLIBC_MAP = {
@@ -3756,6 +3758,173 @@ def add_debian_release_hints(versions, release, gcc_version=None):
     if glibc_version:
         versions.add(f"likely_glibc_{glibc_version}")
 
+def normalize_ubuntu_release_hint(release):
+    release = str(release or '').strip()
+    if not release:
+        return None
+    aliases = {
+        "26.04": "26.04",
+        "25.10": "25.10",
+        "25.04": "25.04",
+        "24.10": "24.10",
+        "24.04.2": "24.04",
+        "24.04": "24.04",
+        "23.10": "23.10",
+        "23.04": "23.04",
+        "22.10": "22.10",
+        "22.04.5": "22.04",
+        "22.04.4": "22.04",
+        "22.04.3": "22.04",
+        "22.04": "22.04",
+        "22.04-HWE": "22.04",
+        "21.10": "21.10",
+        "21.04": "21.04",
+        "20.10": "20.10",
+        "20.04.5": "20.04",
+        "20.04.4": "20.04",
+        "20.04.3": "20.04",
+        "20.04": "20.04",
+        "19.10": "19.10",
+        "19.04": "19.04",
+        "18.04.5": "18.04",
+        "18.04.4": "18.04",
+        "18.04.3": "18.04",
+        "18.04": "18.04",
+        "18.04-HWE": "18.04",
+        "17.10": "17.10",
+        "17.04": "17.04",
+        "16.04.5": "16.04",
+        "16.04.4": "16.04",
+        "16.04": "16.04",
+        "16.04-old": "16.04",
+        "15.10": "15.10",
+        "15.04": "15.04",
+        "14.04.5": "14.04",
+        "14.04.4": "14.04",
+        "14.04": "14.04",
+    }
+    if release in aliases:
+        return aliases[release]
+    match = re.match(r'^([0-9]{2}\.[0-9]{2})', release)
+    if match:
+        return match.group(1)
+    return release
+
+def glibc_versions_compatible(lhs, rhs):
+    left = str(lhs or '').strip()
+    right = str(rhs or '').strip()
+    if not left or not right:
+        return True
+    return (
+        left == right
+        or left.startswith(right + '.')
+        or right.startswith(left + '.')
+    )
+
+def extract_target_profile(version_info):
+    version_info = set(version_info or ())
+    target_glibc = None
+    for ver in version_info:
+        if ver.startswith('likely_glibc_'):
+            target_glibc = ver.replace('likely_glibc_', '')
+            break
+    if not target_glibc:
+        for ver in version_info:
+            if ver.startswith('required_glibc_'):
+                target_glibc = ver.replace('required_glibc_', '')
+                break
+    if not target_glibc:
+        for ver in version_info:
+            if ver.startswith('max_glibc_'):
+                target_glibc = ver.replace('max_glibc_', '')
+                break
+
+    target_ubuntu = None
+    target_ubuntu_source = ''
+    for ver in sorted(version_info):
+        if ver.startswith('ubuntu_') and 'inferred' not in ver:
+            target_ubuntu = ver.replace('ubuntu_', '')
+            target_ubuntu_source = 'ELF 字符串'
+            break
+    if not target_ubuntu:
+        for ver in sorted(version_info):
+            if ver.startswith('ubuntu_') and 'inferred' in ver:
+                match = re.search(r'ubuntu_([0-9.]+)', ver)
+                if match:
+                    target_ubuntu = match.group(1)
+                    infer_match = re.search(r'\(([^)]+)\)', ver)
+                    target_ubuntu_source = infer_match.group(1) if infer_match else '推断'
+                    break
+
+    target_debian = None
+    target_debian_source = ''
+    for ver in sorted(version_info):
+        if ver.startswith('debian_') and 'inferred' not in ver:
+            target_debian = ver.replace('debian_', '')
+            target_debian_source = 'ELF 字符串'
+            break
+    if not target_debian:
+        for ver in sorted(version_info):
+            if ver.startswith('debian_') and 'inferred' in ver:
+                match = re.search(r'debian_([A-Za-z0-9.]+)', ver)
+                if match:
+                    target_debian = match.group(1)
+                    infer_match = re.search(r'\(([^)]+)\)', ver)
+                    target_debian_source = infer_match.group(1) if infer_match else '推断'
+                    break
+
+    ubuntu_release = normalize_ubuntu_release_hint(target_ubuntu)
+    debian_release = normalize_debian_release(target_debian) if target_debian else None
+    ubuntu_expected_glibc = UBUNTU_GLIBC_MAP.get(ubuntu_release) if ubuntu_release else None
+    debian_expected_glibc = DEBIAN_GLIBC_MAP.get(debian_release) if debian_release else None
+    ubuntu_conflict = bool(
+        target_ubuntu and target_glibc and ubuntu_expected_glibc
+        and not glibc_versions_compatible(target_glibc, ubuntu_expected_glibc)
+    )
+    debian_conflict = bool(
+        target_debian and target_glibc and debian_expected_glibc
+        and not glibc_versions_compatible(target_glibc, debian_expected_glibc)
+    )
+
+    distro_display = 'unknown'
+    distro_source = ''
+    distro_warning = ''
+    if target_debian:
+        distro_display = f"Debian {target_debian}"
+        distro_source = target_debian_source
+        if debian_conflict:
+            distro_warning = (
+                f"Debian {target_debian} 预期 GLIBC {debian_expected_glibc}，"
+                f"与当前 GLIBC {target_glibc} 不一致，已忽略发行版加权"
+            )
+    elif target_ubuntu:
+        distro_display = f"Ubuntu {target_ubuntu}"
+        distro_source = target_ubuntu_source
+        if ubuntu_conflict:
+            distro_warning = (
+                f"Ubuntu {target_ubuntu} 预期 GLIBC {ubuntu_expected_glibc}，"
+                f"与当前 GLIBC {target_glibc} 不一致，已忽略发行版加权"
+            )
+
+    return {
+        'target_glibc': target_glibc,
+        'target_ubuntu': target_ubuntu,
+        'target_ubuntu_release': ubuntu_release,
+        'target_ubuntu_source': target_ubuntu_source,
+        'target_ubuntu_expected_glibc': ubuntu_expected_glibc,
+        'target_ubuntu_conflict': ubuntu_conflict,
+        'target_debian': target_debian,
+        'target_debian_release': debian_release,
+        'target_debian_source': target_debian_source,
+        'target_debian_expected_glibc': debian_expected_glibc,
+        'target_debian_conflict': debian_conflict,
+        'effective_target_ubuntu': target_ubuntu if target_ubuntu and not ubuntu_conflict else None,
+        'effective_target_debian': target_debian if target_debian and not debian_conflict else None,
+        'distro_display': distro_display,
+        'distro_source': distro_source,
+        'distro_warning': distro_warning,
+    }
+
 def get_glibc_version_from_elf(elf_path):
     if not os.path.exists(elf_path):
         log.error(f"文件不存在: {elf_path}")
@@ -3854,25 +4023,7 @@ def get_glibc_version_from_elf(elf_path):
                             break
                 if inferred_ubuntu:
                     versions.add(f"ubuntu_{inferred_ubuntu} (inferred from GCC {major})")
-                    # 尝试匹配到最近的 LTS 标准版本
-                    ubuntu_to_lts = {
-                        "26.04": "26.04", "25.10": "25.10", "25.04": "25.04",
-                        "24.10": "24.10", "24.04.2": "24.04", "24.04": "24.04",
-                        "23.10": "23.10", "23.04": "23.04", "22.10": "22.10",
-                        "22.04.5": "22.04", "22.04.4": "22.04", "22.04.3": "22.04",
-                        "22.04": "22.04", "22.04-HWE": "22.04",
-                        "21.10": "21.10", "21.04": "21.04", "20.10": "20.10",
-                        "20.04.5": "20.04", "20.04.4": "20.04", "20.04.3": "20.04",
-                        "20.04": "20.04", "19.10": "19.10", "19.04": "19.04",
-                        "18.04.5": "18.04", "18.04.4": "18.04", "18.04.3": "18.04",
-                        "18.04": "18.04", "18.04-HWE": "18.04",
-                        "17.10": "17.10", "17.04": "17.04",
-                        "16.04.5": "16.04", "16.04.4": "16.04", "16.04": "16.04",
-                        "16.04-old": "16.04",
-                        "15.10": "15.10", "15.04": "15.04",
-                        "14.04.5": "14.04", "14.04.4": "14.04", "14.04": "14.04",
-                    }
-                    lts_ver = ubuntu_to_lts.get(inferred_ubuntu, inferred_ubuntu)
+                    lts_ver = normalize_ubuntu_release_hint(inferred_ubuntu)
                     if lts_ver in UBUNTU_GLIBC_MAP:
                         versions.add(f"likely_glibc_{UBUNTU_GLIBC_MAP[lts_ver]}")
     except Exception as e:
@@ -3971,52 +4122,21 @@ def find_by_build_id_cached(target_build_id, index):
 
 def find_by_version_cached(version_info, index, target_arch):
     """Version-based lookup using cached index - no filesystem scan needed"""
-    target_glibc = None
-    for ver in version_info:
-        if ver.startswith('likely_glibc_'):
-            target_glibc = ver.replace('likely_glibc_', '')
-            break
-    if not target_glibc:
-        for ver in version_info:
-            if ver.startswith('required_glibc_'):
-                target_glibc = ver.replace('required_glibc_', '')
-                break
-    if not target_glibc:
-        for ver in version_info:
-            if ver.startswith('max_glibc_'):
-                target_glibc = ver.replace('max_glibc_', '')
-                break
-
-    target_ubuntu = None
-    for ver in version_info:
-        if ver.startswith('ubuntu_') and 'inferred' not in ver:
-            target_ubuntu = ver.replace('ubuntu_', '')
-            break
-    if not target_ubuntu:
-        for ver in version_info:
-            if ver.startswith('ubuntu_') and 'inferred' in ver:
-                match = re.search(r'ubuntu_([0-9.]+)', ver)
-                if match:
-                    target_ubuntu = match.group(1)
-                    break
-    target_debian = None
-    for ver in version_info:
-        if ver.startswith('debian_') and 'inferred' not in ver:
-            target_debian = ver.replace('debian_', '')
-            break
-    if not target_debian:
-        for ver in version_info:
-            if ver.startswith('debian_') and 'inferred' in ver:
-                match = re.search(r'debian_([A-Za-z0-9.]+)', ver)
-                if match:
-                    target_debian = match.group(1)
-                    break
+    profile = extract_target_profile(version_info)
+    target_glibc = profile['target_glibc']
+    target_ubuntu = profile['effective_target_ubuntu']
+    target_debian = profile['effective_target_debian']
+    distro_display = profile['distro_display']
+    if profile['distro_source']:
+        distro_display += f" ({profile['distro_source']})"
 
     log.info(
         f"目标 GLIBC: {stderr_version(target_glibc or 'unknown')}, "
-        f"目标发行版: {stderr_version(('Debian ' + target_debian) if target_debian else (('Ubuntu ' + target_ubuntu) if target_ubuntu else 'unknown'))}, "
+        f"目标发行版: {stderr_version(distro_display)}, "
         f"目标架构: {stderr_name(target_arch)}"
     )
+    if profile['distro_warning']:
+        log.warning(profile['distro_warning'])
 
     candidate_ids = set()
     if target_glibc:
@@ -4498,6 +4618,38 @@ def truncate_ui_text(text, max_length=96):
         return text[:max_length]
     return text[:max_length - 3] + '...'
 
+def tui_style(text, fg=None, bg=None, bold=False, dim=False, italic=False, reverse=False):
+    codes = []
+    if bold:
+        codes.append('1')
+    if dim:
+        codes.append('2')
+    if italic:
+        codes.append('3')
+    if reverse:
+        codes.append('7')
+    if fg is not None:
+        codes.append(f'38;5;{fg}')
+    if bg is not None:
+        codes.append(f'48;5;{bg}')
+    if not codes:
+        return str(text)
+    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
+
+def tui_kv(label, value, label_color=110, value_color=252, bold_value=False, dim_value=False):
+    return (
+        f"{tui_style(str(label) + ':', fg=label_color, bold=True)} "
+        f"{tui_style(value, fg=value_color, bold=bold_value, dim=dim_value)}"
+    )
+
+def render_tui_text_line(line, indent="  ", plain_color=251):
+    line = str(line or '')
+    if not line:
+        return ''
+    if '\x1b[' in line:
+        return f"{indent}{line}"
+    return f"{indent}{tui_style(line, fg=plain_color)}"
+
 def selector_window_bounds(total_count, selected_index, window_size):
     if total_count <= window_size:
         return 0, total_count
@@ -4509,7 +4661,7 @@ def selector_window_bounds(total_count, selected_index, window_size):
         start = end - window_size
     return start, end
 
-def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情'):
+def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情', context_lines=None):
     if not entries:
         return None
     if not prompt_toolkit_selector_available():
@@ -4536,35 +4688,38 @@ def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情')
         selected_entry = entries[selected_index]
         start, end = selector_window_bounds(len(entries), selected_index, max_visible_items)
         lines = [
-            f"\x1b[1m\x1b[38;5;183m{title}\x1b[0m",
+            tui_style(title, fg=183, bold=True),
             "",
-            f"\x1b[38;5;245m{subtitle}\x1b[0m",
+            tui_style(subtitle, fg=245),
             "",
         ]
+        if context_lines:
+            lines.append(tui_style("ELF 信息", fg=81, bold=True))
+            for context_line in context_lines:
+                lines.append(render_tui_text_line(context_line))
+            lines.append("")
         if start > 0:
-            lines.append("\x1b[2m  ...\x1b[0m")
+            lines.append(tui_style("  ...", dim=True))
         for index in range(start, end):
             item = entries[index]
             selected = index == selected_index
             prefix = "❯" if selected else " "
-            label_color = "255" if selected else "251"
             label = truncate_ui_text(item.get('label', ''), max_length=110)
-            line = (
-                f"{prefix} \x1b[{'1;' if selected else ''}3m\x1b[38;5;{label_color}m{label}\x1b[0m"
-            )
             if selected:
-                line = f"\x1b[7m{line}\x1b[0m"
+                line = tui_style(f"{prefix} {label}", fg=255, bold=True, italic=True, reverse=True)
+            else:
+                line = f"{prefix} {tui_style(label, fg=251, italic=True)}"
             lines.append(line)
         if end < len(entries):
-            lines.append("\x1b[2m  ...\x1b[0m")
+            lines.append(tui_style("  ...", dim=True))
         lines.extend([
             "",
-            f"\x1b[2m{selected_index + 1}/{len(entries)} | Enter 确认 | q 取消\x1b[0m",
+            tui_style(f"{selected_index + 1}/{len(entries)} | Enter 确认 | q 取消", dim=True),
             "",
-            f"\x1b[1m\x1b[38;5;120m{detail_title}\x1b[0m",
+            tui_style(detail_title, fg=120, bold=True),
         ])
         for detail_line in selected_entry.get('detail_lines', ()):
-            lines.append(f"  \x1b[3m\x1b[38;5;251m{detail_line}\x1b[0m")
+            lines.append(render_tui_text_line(detail_line))
         return ANSI("\n".join(lines))
 
     body = Window(
@@ -4632,6 +4787,28 @@ def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情')
         return None
     return entries[state['result_index']].get('value')
 
+def build_elf_selector_context_lines(elf_path, matches):
+    build_id, arch = inspect_elf_metadata(elf_path)
+    profile = extract_target_profile(get_glibc_version_from_elf(elf_path))
+    context_lines = [
+        tui_kv('ELF', os.path.basename(elf_path), value_color=255, bold_value=True),
+        tui_kv('路径', truncate_ui_text(elf_path, max_length=110), value_color=250),
+        tui_kv('架构', arch or 'unknown', value_color=229, bold_value=True),
+        tui_kv('GLIBC', profile['target_glibc'] or 'unknown', value_color=213, bold_value=True),
+        tui_kv('发行版', profile['distro_display'], value_color=222, bold_value=(profile['distro_display'] != 'unknown')),
+        tui_kv('来源', profile['distro_source'] or 'unknown', value_color=186, dim_value=(profile['distro_source'] == '')),
+        tui_kv('候选数', len(matches), value_color=226, bold_value=True),
+    ]
+    if build_id:
+        context_lines.append(
+            tui_kv('Build ID', truncate_ui_text(build_id, max_length=40), value_color=150)
+        )
+    if profile['distro_warning']:
+        context_lines.append(
+            tui_kv('状态', profile['distro_warning'], label_color=203, value_color=203, bold_value=True)
+        )
+    return context_lines
+
 def build_libc_selector_entries(matches):
     entries = []
     for index, match in enumerate(matches):
@@ -4642,17 +4819,17 @@ def build_libc_selector_entries(matches):
             f"score {match.get('score', 'N/A')}"
         )
         detail_lines = [
-            f"名称: {match.get('name', '<unknown>')}",
-            f"GLIBC: {match.get('glibc_ver', 'unknown')}",
-            f"架构: {match.get('arch', 'unknown')}",
-            f"匹配度: {match.get('score', 'N/A')}",
-            f"原因: {reason}",
+            tui_kv('名称', match.get('name', '<unknown>'), value_color=255, bold_value=True),
+            tui_kv('GLIBC', match.get('glibc_ver', 'unknown'), value_color=213, bold_value=True),
+            tui_kv('架构', match.get('arch', 'unknown'), value_color=229),
+            tui_kv('匹配度', match.get('score', 'N/A'), value_color=226, bold_value=True),
+            tui_kv('原因', reason, value_color=186),
         ]
         if match.get('info'):
-            detail_lines.append(f"信息: {match['info']}")
+            detail_lines.append(tui_kv('信息', match['info'], value_color=250))
         if match.get('variants', 1) > 1:
-            detail_lines.append(f"子版本: {match['variants']} 个")
-        detail_lines.append(f"路径: {match.get('path', '')}")
+            detail_lines.append(tui_kv('子版本', f"{match['variants']} 个", value_color=222, bold_value=True))
+        detail_lines.append(tui_kv('路径', match.get('path', ''), value_color=250))
         entries.append({
             'label': label,
             'detail_lines': detail_lines,
@@ -6280,6 +6457,7 @@ def choose_libc_candidate_for_elf(elf_path, args):
         ),
         build_libc_selector_entries(matches),
         detail_title='libc 详情',
+        context_lines=build_elf_selector_context_lines(elf_path, matches),
     )
     if tui_selected is not _PROMPT_TOOLKIT_UNAVAILABLE:
         if tui_selected is None:

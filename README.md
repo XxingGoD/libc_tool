@@ -158,6 +158,7 @@ python3 libc_tool.py download -y ./pwn
 在交互终端里，如果不加 `-y`，`libc_tool` 会自动启用基于 Python `prompt_toolkit` 的 TUI 选择器：
 
 - 选择候选 `libc`
+- 在 `libc` 选择界面顶部显示当前 ELF 的路径、架构、目标 GLIBC、发行版推断和候选数量，并带颜色高亮
 - 选择 `docker --destroy` 要销毁的容器/镜像
 
 如果你更喜欢旧的编号输入模式，可以临时关闭：
