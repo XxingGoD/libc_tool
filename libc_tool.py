@@ -4,6 +4,7 @@ import re
 import json
 import gzip
 import lzma
+import shlex
 import shutil
 import sys
 import hashlib
@@ -30,30 +31,62 @@ except Exception as e:
         log_level = 'info'
 
         @contextmanager
-        def local(self, **_kwargs):
-            yield self
+        def local(self, **kwargs):
+            old_values = {}
+            for key, value in kwargs.items():
+                old_values[key] = getattr(self, key, None)
+                setattr(self, key, value)
+            try:
+                yield self
+            finally:
+                for key, value in old_values.items():
+                    setattr(self, key, value)
 
     class _FallbackLog:
-        def _emit(self, level, message):
-            sys.stderr.write(f"[{level}] {message}\n")
+        LEVELS = {
+            'debug': 10,
+            'info': 20,
+            'success': 20,
+            'warning': 30,
+            'warn': 30,
+            'error': 40,
+            'failure': 40,
+        }
+        PREFIXES = {
+            'debug': '*',
+            'info': '*',
+            'success': '+',
+            'warning': '!',
+            'error': 'x',
+            'failure': '-',
+        }
+
+        def _emit(self, level_name, message):
+            current_level = str(getattr(context, 'log_level', 'info') or 'info').lower()
+            current_value = self.LEVELS.get(current_level, 20)
+            level_value = self.LEVELS.get(level_name, 20)
+            if level_value < current_value:
+                return
+            prefix = self.PREFIXES.get(level_name, '*')
+            sys.stderr.write(f"[{prefix}] {message}\n")
 
         def debug(self, message):
-            self._emit('*', message)
+            self._emit('debug', message)
 
         def info(self, message):
-            self._emit('*', message)
+            self._emit('info', message)
 
         def warning(self, message):
-            self._emit('!', message)
+            self._emit('warning', message)
 
         def error(self, message):
-            self._emit('x', message)
+            self._emit('error', message)
 
         def failure(self, message):
-            self._emit('-', message)
+            self._emit('failure', message)
 
         def success(self, message):
-            self._emit('+', message)
+            self._emit('success', message)
 
     class _FallbackText:
         pass
@@ -67,6 +100,11 @@ except Exception as e:
 
 LIBC_DB_PATH = "/home/starlight/CtfTools/libc-database/db"
 LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
+DOCKER_TEMPLATE_ROOT = "/home/starlight/CTF/deploy_pwn_template"
+LOCAL_DOCKER_TEMPLATE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deploy_pwn_template')
+DOCKER_BUNDLE_DIRNAME = 'bundle'
+DOCKER_BUNDLE_CHALLENGE_DIRNAME = 'challenge'
+DOCKER_BUNDLE_RUNTIME_DIRNAME = 'runtime'
 CACHE_SCHEMA_VERSION = 5
 INDEX_BUILD_MAX_WORKERS = 8
 FILE_ANALYSIS_CACHE = {}
@@ -200,6 +238,9 @@ ANSI_CODES = {
 
 PATCH_BACKUP_SUFFIX = '.bak'
 PATCH_SCHEMA_VERSION = 1
+DOCKER_MANAGED_LABEL = 'libc_tool.managed'
+DOCKER_MANAGED_CONTAINER_PREFIX = 'libc-tool-'
+DOCKER_MANAGED_IMAGE_PREFIX = 'libc_tool_docker_'
 
 def stream_supports_color(stream):
     if os.environ.get("NO_COLOR") is not None:
@@ -1340,6 +1381,69 @@ def tcp_probe(host, port, timeout=3):
     except Exception as e:
         return False, str(e)
 
+def local_tcp_port_available(port, bind_host='0.0.0.0'):
+    try:
+        port = int(port)
+    except Exception:
+        return False, 'invalid port'
+    if port < 1 or port > 65535:
+        return False, 'port out of range'
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((bind_host, port))
+        return True, ''
+    except OSError as e:
+        return False, str(e)
+    finally:
+        sock.close()
+
+def collect_managed_docker_port_owners():
+    owners = {}
+    try:
+        targets = collect_libc_tool_docker_targets()
+    except Exception:
+        return owners
+    for target in targets:
+        display = target.get('display_name') or target.get('container_name') or '<unknown>'
+        kind = target.get('kind') or 'docker'
+        for field, role in (('host_port', 'service'), ('gdb_port', 'gdb')):
+            raw_value = str(target.get(field) or '').strip()
+            if not raw_value:
+                continue
+            for item in raw_value.split(','):
+                item = item.strip()
+                if not item.isdigit():
+                    continue
+                owners.setdefault(int(item), []).append({
+                    'display_name': display,
+                    'kind': kind,
+                    'role': role,
+                })
+    return owners
+
+def describe_managed_port_owner(port, owners):
+    records = owners.get(int(port), [])
+    if not records:
+        return ''
+    return '; '.join(
+        f"{item['display_name']} ({item['kind']}/{item['role']})"
+        for item in records
+    )
+
+def scan_available_tcp_ports(start_port, count=8, exclude_ports=None, limit=256):
+    exclude_ports = {int(item) for item in (exclude_ports or ())}
+    candidates = []
+    current = max(1, int(start_port))
+    scanned = 0
+    while current <= 65535 and scanned < limit and len(candidates) < count:
+        scanned += 1
+        if current not in exclude_ports:
+            ok, _detail = local_tcp_port_available(current)
+            if ok:
+                candidates.append(current)
+        current += 1
+    return candidates
+
 def append_doctor_check(checks, name, status, detail, required=True):
     checks.append({
         'name': name,
@@ -2071,6 +2175,56 @@ def find_local_libc_database_url(libc_path):
         return None
     return re.sub(r'(?<!:)//+', '/', package_url)
 
+def distro_from_package_version(package_version):
+    text_value = str(package_version or '').lower()
+    if 'ubuntu' in text_value:
+        return 'ubuntu'
+    if '+deb' in text_value:
+        return 'debian'
+    return None
+
+def release_from_package_version(package_version):
+    package_version = str(package_version or '')
+    distro = distro_from_package_version(package_version)
+    if distro == 'ubuntu':
+        glibc_ver = package_version.split('-', 1)[0]
+        for ubuntu_ver, mapped_glibc in UBUNTU_GLIBC_MAP.items():
+            if mapped_glibc == glibc_ver:
+                return ubuntu_ver
+        return None
+    if distro == 'debian':
+        debian_suffix_match = re.search(r'\+deb(\d+)u\d+', package_version)
+        if debian_suffix_match:
+            return debian_suffix_match.group(1)
+        glibc_ver = package_version.split('-', 1)[0]
+        for debian_release, mapped_glibc in DEBIAN_GLIBC_MAP.items():
+            if debian_release.isdigit() and mapped_glibc == glibc_ver:
+                return debian_release
+    return None
+
+def normalize_repository_package_url(package_url):
+    normalized = re.sub(r'(?<!:)//+', '/', str(package_url or '').strip())
+    return normalized or None
+
+def build_repository_metadata_from_package_url(package_url, package_version=None, arch=None):
+    package_url = normalize_repository_package_url(package_url)
+    if not package_url:
+        return {}
+    parsed = parse_deb_package_filename(package_url) or {}
+    package_version = package_version or parsed.get('version')
+    arch = arch or parsed.get('arch')
+    distro = distro_from_package_version(package_version)
+    release = release_from_package_version(package_version)
+    metadata = {
+        'package_url': package_url,
+        'package_version': package_version,
+        'package_filename': os.path.basename(package_url),
+        'package_arch': arch,
+        'package_distro': distro,
+        'package_release': release,
+    }
+    return metadata
+
 def elf_has_dynamic_section(elf_path):
     fast_info = inspect_elf_fast(elf_path)
     if fast_info is not None:
@@ -2604,6 +2758,27 @@ def download_matching_deb_libc_package(libc_path):
         log.warning("无法通过本地 URL 或 Ubuntu/Debian 仓库索引回退下载 libc")
     return None
 
+def download_candidate_libc_package(candidate):
+    if not candidate:
+        return None
+    package_url = normalize_repository_package_url(candidate.get('package_url'))
+    if not package_url:
+        return None
+    cache_key = hashlib.sha256(f'candidate:{package_url}'.encode()).hexdigest()[:16]
+    distro = candidate.get('package_distro')
+    release = candidate.get('package_release')
+    extracted_dir = download_and_extract_libc_package_with_debug(
+        package_url,
+        cache_key,
+        distro=distro,
+        release=release,
+    )
+    if not extracted_dir:
+        return None
+    try_unstrip_libc_tree(extracted_dir)
+    log.success(f'已通过索引元数据下载 libc: {stderr_path(extracted_dir)}')
+    return extracted_dir
+
 def find_unstripped_libc_in_dir(target_dir):
     for libc_file in sorted(find_libc_files_in_tree(target_dir)):
         if elf_has_debug_symbols(libc_file):
@@ -2690,12 +2865,62 @@ def infer_download_context_from_libc(libc_path):
     log.warning("无法推断目标 Ubuntu/Debian 版本，跳过额外依赖补全")
     return None
 
+def infer_download_context_from_candidate(candidate):
+    if candidate is None:
+        return None
+    arch = normalize_deb_arch_name(candidate.get('package_arch') or candidate.get('arch'))
+    if arch == 'unknown':
+        log.warning("无法识别 libc 架构，跳过额外依赖补全")
+        return None
+    distro = candidate.get('package_distro')
+    release = candidate.get('package_release')
+    if distro:
+        return distro, release, arch
+    libc_path = candidate.get('path')
+    if libc_path and os.path.exists(libc_path):
+        return infer_download_context_from_libc(libc_path)
+    log.warning("无法推断目标 Ubuntu/Debian 版本，跳过额外依赖补全")
+    return None
+
 def download_extra_packages(libc_path, target_dir, extra_packages=None):
     packages = normalize_package_name_list(extra_packages)
     if not packages:
         return []
 
     download_context = infer_download_context_from_libc(libc_path)
+    if not download_context:
+        return []
+    distro, release, arch = download_context
+
+    copied = []
+    log.info(
+        f"检查额外包: 目标 {stderr_version(format_download_context(distro, release, arch))}, "
+        f"指定 {stderr_number(len(packages))} 个"
+    )
+    for package_name in packages:
+        package_url = find_repository_package_url([package_name], distro, release, arch)
+        if not package_url:
+            log.warning(f"未找到额外包 {stderr_name(package_name)}")
+            continue
+        cache_key = hashlib.sha256(f'pkg:{package_url}'.encode()).hexdigest()[:16]
+        extracted_dir = download_and_extract_deb_package(package_url, cache_key)
+        if not extracted_dir:
+            continue
+        copied_now = copy_shared_object_artifacts(extracted_dir, target_dir, require_dynamic=True)
+        if copied_now:
+            copied.extend(copied_now)
+            copied_targets = ", ".join(stderr_path(path) for path in copied_now)
+            log.success(f"拉取额外包 {stderr_name(package_name)} 来自 {stderr_path(package_url)} -> {copied_targets}")
+        else:
+            log.info(f"额外包 {stderr_name(package_name)} 未新增共享库文件")
+    return copied
+
+def download_extra_packages_from_candidate(candidate, target_dir, extra_packages=None):
+    packages = normalize_package_name_list(extra_packages)
+    if not packages:
+        return []
+
+    download_context = infer_download_context_from_candidate(candidate)
     if not download_context:
         return []
     distro, release, arch = download_context
@@ -2731,6 +2956,85 @@ def download_missing_dependencies(libc_path, elf_path, target_dir, missing=None,
         return []
 
     download_context = infer_download_context_from_libc(libc_path)
+    if not download_context:
+        return []
+    distro, release, arch = download_context
+
+    copied = []
+    log.info(
+        f"检查额外依赖: 目标 {stderr_version(format_download_context(distro, release, arch))}, "
+        f"缺失 {stderr_number(len(missing))} 个"
+    )
+    required_versions_by_soname = get_required_abi_versions_by_soname(elf_path)
+    runtime_libc_path = find_library_artifact(target_dir, 'libc.so.6', require_dynamic=True)
+    for soname in missing:
+        package_names = guess_package_names_from_soname_with_hints(soname, package_hints=package_hints)
+        if not package_names:
+            log.warning(f"无法推断 {stderr_name(soname)} 对应的 Debian/Ubuntu 包")
+            continue
+        required_versions = required_versions_by_soname.get(soname, set())
+        if required_versions:
+            log.info(
+                f"{stderr_name(soname)} 需要 ABI 版本: "
+                f"{stderr_version(summarize_abi_versions(required_versions))}"
+            )
+
+        attempted = False
+        satisfied = False
+        for package_url in iter_repository_package_urls(package_names, distro, release, arch):
+            attempted = True
+            cache_key = hashlib.sha256(package_url.encode()).hexdigest()[:16]
+            extracted_dir = download_and_extract_deb_package(package_url, cache_key)
+            if not extracted_dir:
+                continue
+            candidate_lib = find_library_artifact(extracted_dir, soname, require_dynamic=True)
+            status = library_satisfies_abi_requirements(
+                candidate_lib,
+                soname,
+                required_versions=required_versions,
+            )
+            if not status['ok']:
+                log.info(
+                    f"跳过 {stderr_name(soname)} 候选包 {stderr_path(package_url)}: "
+                    f"{describe_library_abi_status(status)}"
+                )
+                continue
+            runtime_status = library_satisfies_runtime_libc(candidate_lib, runtime_libc_path)
+            if not runtime_status['ok']:
+                log.info(
+                    f"跳过 {stderr_name(soname)} 候选包 {stderr_path(package_url)}: "
+                    f"{describe_library_abi_status(runtime_status)}"
+                )
+                continue
+            copied_now = copy_shared_object_artifacts(
+                extracted_dir,
+                target_dir,
+                wanted_names={soname},
+                overwrite=True,
+                require_dynamic=True,
+            )
+            if copied_now:
+                copied.extend(copied_now)
+                copied_targets = ", ".join(stderr_path(path) for path in copied_now)
+                log.success(f"补全依赖 {stderr_name(soname)} 来自 {stderr_path(package_url)} -> {copied_targets}")
+            else:
+                log.warning(f"已下载 {stderr_name(soname)} 对应包，但未复制目标库文件")
+            satisfied = True
+            break
+        if not attempted:
+            log.warning(f"未找到 {stderr_name(soname)} 的 Debian/Ubuntu 包（候选: {', '.join(package_names)}）")
+        elif not satisfied:
+            log.warning(f"未找到满足版本要求的 {stderr_name(soname)} 包（候选: {', '.join(package_names)}）")
+    return copied
+
+def download_missing_dependencies_from_candidate(candidate, elf_path, target_dir, missing=None, extra_needed=None, package_hints=None):
+    if not elf_path and not extra_needed:
+        return []
+    missing = list(missing if missing is not None else get_missing_needed_libraries(elf_path, target_dir, extra_needed=extra_needed))
+    if not missing:
+        return []
+
+    download_context = infer_download_context_from_candidate(candidate)
     if not download_context:
         return []
     distro, release, arch = download_context
@@ -2960,6 +3264,15 @@ def build_index_entry(so_file, db_path):
         with open(info_path, 'r') as f:
             info = f.read().strip()
 
+    package_url = find_local_libc_database_url(so_path)
+    repository_meta = build_repository_metadata_from_package_url(
+        package_url,
+        package_version=(
+            get_ubuntu_glibc_package_version(so_path)
+            or get_debian_glibc_package_version(so_path)
+        ),
+        arch=normalize_deb_arch_name(arch),
+    )
     symbol_suffixes = load_symbol_suffixes(
         os.path.join(db_path, entry_id + '.symbols')
     )
@@ -2972,6 +3285,12 @@ def build_index_entry(so_file, db_path):
         "arch": arch,
         "version": file_ver,
         "info": info,
+        "package_url": repository_meta.get('package_url'),
+        "package_version": repository_meta.get('package_version'),
+        "package_filename": repository_meta.get('package_filename'),
+        "package_arch": repository_meta.get('package_arch'),
+        "package_distro": repository_meta.get('package_distro'),
+        "package_release": repository_meta.get('package_release'),
         "symbol_suffixes": symbol_suffixes,
     }
 
@@ -3164,6 +3483,23 @@ def get_entry_by_id(index, entry_id):
         if entry.get('id') == entry_id:
             return entry
     return None
+
+def attach_entry_metadata_to_match(match, entry):
+    enriched = dict(match)
+    if not entry:
+        return enriched
+    for key in (
+        'id',
+        'package_url',
+        'package_version',
+        'package_filename',
+        'package_arch',
+        'package_distro',
+        'package_release',
+    ):
+        if entry.get(key) is not None:
+            enriched[key] = entry.get(key)
+    return enriched
 
 def symbol_count(entry):
     return len(entry.get('symbol_suffixes', {}))
@@ -3567,7 +3903,7 @@ def find_by_sha1(target_sha1, index):
         entry = get_entry_by_id(index, entry_id)
         if not entry:
             continue
-        matches.append({
+        matches.append(attach_entry_metadata_to_match({
             'path': entry['path'],
             'name': os.path.basename(entry['path']),
             'match_type': 'exact_sha1',
@@ -3577,7 +3913,7 @@ def find_by_sha1(target_sha1, index):
             'arch': entry.get('arch', 'unknown'),
             'info': entry.get('info', ''),
             'symbol_count': symbol_count(entry),
-        })
+        }, entry))
     if matches:
         return matches
     return []
@@ -3597,7 +3933,7 @@ def find_by_build_id_cached(target_build_id, index):
         if not entry:
             continue
         seen.add(entry_id)
-        matches.append({
+        matches.append(attach_entry_metadata_to_match({
             'path': entry['path'],
             'name': os.path.basename(entry['path']),
             'match_type': 'exact',
@@ -3607,7 +3943,7 @@ def find_by_build_id_cached(target_build_id, index):
             'arch': entry.get('arch', 'unknown'),
             'info': entry.get('info', ''),
             'symbol_count': symbol_count(entry),
-        })
+        }, entry))
 
     partial_ids = index.get("by_build_id_prefix", {}).get(target[:16], [])
     if isinstance(partial_ids, str):
@@ -3620,7 +3956,7 @@ def find_by_build_id_cached(target_build_id, index):
         if not entry:
             continue
         cached_bid = entry.get("build_id", "")
-        matches.append({
+        matches.append(attach_entry_metadata_to_match({
             'path': entry['path'],
             'name': os.path.basename(entry['path']),
             'match_type': 'partial',
@@ -3630,7 +3966,7 @@ def find_by_build_id_cached(target_build_id, index):
             'arch': entry.get('arch', 'unknown'),
             'info': entry.get('info', ''),
             'symbol_count': symbol_count(entry),
-        })
+        }, entry))
     return matches
 
 def find_by_version_cached(version_info, index, target_arch):
@@ -3775,7 +4111,7 @@ def find_by_version_cached(version_info, index, target_arch):
 
         if score > 100:
             name = os.path.basename(entry['path'])
-            matches.append({
+            matches.append(attach_entry_metadata_to_match({
                 'path': entry['path'],
                 'name': name,
                 'match_type': 'version',
@@ -3788,7 +4124,7 @@ def find_by_version_cached(version_info, index, target_arch):
                 'version_match_rank': version_match_rank,
                 'distro_score': distro_score,
                 'arch_score': preferred_arch_package_score(name, target_arch),
-            })
+            }, entry))
 
     matches.sort(key=lambda x: libc_candidate_sort_key(x, target_arch), reverse=True)
     return matches
@@ -3847,7 +4183,7 @@ def find_by_symbol_address(elf_path, index, target_arch=None):
         if not entry:
             continue
         name = os.path.basename(entry['path'])
-        matches.append({
+        matches.append(attach_entry_metadata_to_match({
             'path': entry['path'],
             'name': name,
             'match_type': 'symbol_address',
@@ -3859,24 +4195,27 @@ def find_by_symbol_address(elf_path, index, target_arch=None):
             'symbol_count': symbol_count(entry),
             'matched_symbol_count': len(symbol_constraints),
             'arch_score': preferred_arch_package_score(name, target_arch),
-        })
+        }, entry))
 
     return matches
 
-def auto_find_libc(elf_path, candidate_limit=20, group_variants=True):
+def auto_find_libc(elf_path, candidate_limit=20, group_variants=True, quiet=False):
     index = ensure_index_cache()
     if not index:
         return []
 
-    log.info(f"分析文件: {stderr_path(elf_path)}")
+    if not quiet:
+        log.info(f"分析文件: {stderr_path(elf_path)}")
     build_id, arch = inspect_elf_metadata(elf_path)
-    log.info(f"架构: {stderr_name(arch)}")
+    if not quiet:
+        log.info(f"架构: {stderr_name(arch)}")
 
     # Strategy 1: SHA1 exact match (fastest)
     file_sha1 = sha1_of_file(elf_path)
     sha1_matches = find_by_sha1(file_sha1, index)
     if sha1_matches:
-        log.success(f"SHA1 精确匹配: {stderr_name(sha1_matches[0]['name'])}")
+        if not quiet:
+            log.success(f"SHA1 精确匹配: {stderr_name(sha1_matches[0]['name'])}")
         return sha1_matches
 
     # Strategy 2: Build ID match via cache
@@ -3886,26 +4225,29 @@ def auto_find_libc(elf_path, candidate_limit=20, group_variants=True):
         build_id = None
 
     if build_id:
-        log.success(f"Build ID: {stderr_hash(build_id)}")
+        if not quiet:
+            log.success(f"Build ID: {stderr_hash(build_id)}")
         bid_matches = find_by_build_id_cached(build_id, index)
         if bid_matches:
-            log.success(f"通过 Build ID 找到 {stderr_number(len(bid_matches))} 个匹配:")
-            for m in bid_matches[:3]:
-                match_type = "精确" if m['match_type'] == 'exact' else "部分"
-                log.info(f"  [{stderr_choice(match_type)}] {stderr_name(m['name'])}")
-                log.info(f"      路径: {stderr_path(m['path'])}")
+            if not quiet:
+                log.success(f"通过 Build ID 找到 {stderr_number(len(bid_matches))} 个匹配:")
+                for m in bid_matches[:3]:
+                    match_type = "精确" if m['match_type'] == 'exact' else "部分"
+                    log.info(f"  [{stderr_choice(match_type)}] {stderr_name(m['name'])}")
+                    log.info(f"      路径: {stderr_path(m['path'])}")
             all_matches.extend(bid_matches)
 
     sym_matches = find_by_symbol_address(elf_path, index, arch)
     if sym_matches:
-        log.success(f"通过符号地址找到 {stderr_number(len(sym_matches))} 个匹配:")
-        for m in sym_matches[:3]:
-            log.info(f"  {stderr_name(m['name'])} (GLIBC {stderr_version(m['glibc_ver'])})")
+        if not quiet:
+            log.success(f"通过符号地址找到 {stderr_number(len(sym_matches))} 个匹配:")
+            for m in sym_matches[:3]:
+                log.info(f"  {stderr_name(m['name'])} (GLIBC {stderr_version(m['glibc_ver'])})")
         all_matches.extend(sym_matches)
 
     # Strategy 4: Version-based matching
     versions = get_glibc_version_from_elf(elf_path)
-    if versions:
+    if versions and not quiet:
         log.success("检测到版本信息:")
         for v in sorted(versions):
             log.info(f"  - {stderr_version(v)}")
@@ -3930,51 +4272,61 @@ def auto_find_libc(elf_path, candidate_limit=20, group_variants=True):
         ranked_matches = unique_matches
 
     visible_matches = truncate_candidates(ranked_matches, candidate_limit)
-    log.success(
-        f"找到 {stderr_number(len(ranked_matches))} 个候选 libc（按匹配度排序）"
-        + (
-            f"，当前显示 {stderr_number(len(visible_matches))} 个"
-            if len(visible_matches) != len(ranked_matches) else ""
+    if not quiet:
+        log.success(
+            f"找到 {stderr_number(len(ranked_matches))} 个候选 libc（按匹配度排序）"
+            + (
+                f"，当前显示 {stderr_number(len(visible_matches))} 个"
+                if len(visible_matches) != len(ranked_matches) else ""
+            )
+            + ":"
         )
-        + ":"
-    )
-    for i, m in enumerate(visible_matches):
-        log.info(f"[{stderr_choice(i)}] {stderr_name(m['name'])}")
-        log.info(
-            f"    匹配度: {stderr_number(m.get('score', 'N/A'))}, "
-            f"原因: {stderr_style(m.get('reason', m.get('match_type', '')), 'yellow')}"
-        )
-        log.info(f"    GLIBC: {stderr_version(m.get('glibc_ver', 'unknown'))}")
-        log.info(f"    信息: {m.get('info', '')}")
-        log.info(f"    路径: {stderr_path(m['path'])}")
-        if group_variants and m.get('variants', 1) > 1:
-            log.info(f"    子版本: {stderr_number(m['variants'])} 个，可使用 {stderr_hint('--all-variants')} 查看全部")
-        if i == 0:
-            log.info(f"    {stderr_hint('>>> 推荐 <<<')}")
+        for i, m in enumerate(visible_matches):
+            log.info(f"[{stderr_choice(i)}] {stderr_name(m['name'])}")
+            log.info(
+                f"    匹配度: {stderr_number(m.get('score', 'N/A'))}, "
+                f"原因: {stderr_style(m.get('reason', m.get('match_type', '')), 'yellow')}"
+            )
+            log.info(f"    GLIBC: {stderr_version(m.get('glibc_ver', 'unknown'))}")
+            log.info(f"    信息: {m.get('info', '')}")
+            log.info(f"    路径: {stderr_path(m['path'])}")
+            if group_variants and m.get('variants', 1) > 1:
+                log.info(f"    子版本: {stderr_number(m['variants'])} 个，可使用 {stderr_hint('--all-variants')} 查看全部")
+            if i == 0:
+                log.info(f"    {stderr_hint('>>> 推荐 <<<')}")
 
     return visible_matches
 
-def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_needed=None, package_hints=None, extra_packages=None):
+def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_needed=None, package_hints=None, extra_packages=None, libc_candidate=None):
     ensure_pwntools_cache_dir()
     libc_dir = None
     primary_error = None
-    try:
-        libc_dir = libcdb.download_libraries(libc_path)
-    except Exception as e:
-        primary_error = e
-        log.warning(f'主下载链路失败，准备回退到 Ubuntu/Debian 仓库索引: {e}')
+    local_libc_available = bool(libc_path and os.path.exists(libc_path))
+    if local_libc_available:
+        try:
+            libc_dir = libcdb.download_libraries(libc_path)
+        except Exception as e:
+            primary_error = e
+            log.warning(f'主下载链路失败，准备回退到 Ubuntu/Debian 仓库索引: {e}')
     if libc_dir is None or not os.path.exists(libc_dir):
-        fallback_dir = download_matching_deb_libc_package(libc_path)
+        fallback_dir = None
+        if libc_candidate:
+            fallback_dir = download_candidate_libc_package(libc_candidate)
+        if not fallback_dir and local_libc_available:
+            fallback_dir = download_matching_deb_libc_package(libc_path)
         if fallback_dir:
             libc_dir = fallback_dir
         else:
             if primary_error is not None:
                 log.failure(f'libc 库下载失败: {primary_error}')
             else:
-                log.failure('libc 库下载失败，请检查网络、仓库镜像或 libc 文件有效性')
+                if libc_candidate and libc_candidate.get('package_url'):
+                    log.failure('libc 库下载失败，请检查网络、仓库镜像或索引元数据有效性')
+                else:
+                    log.failure('libc 库下载失败，请检查网络、仓库镜像或 libc 文件有效性')
             return None
     libc_dir = libc_dir.decode() if isinstance(libc_dir, bytes) else libc_dir
-    if not find_unstripped_libc_in_dir(libc_dir):
+    if local_libc_available and not find_unstripped_libc_in_dir(libc_dir):
         unstripped_dir = try_unstrip_cached_libc_dir_from_local_url(libc_path, libc_dir)
         if unstripped_dir:
             libc_dir = unstripped_dir
@@ -3994,7 +4346,8 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
         overwrite=bool(find_unstripped_libc_in_dir(libc_dir)),
         require_dynamic=True,
     )
-    copied_files.extend(copy_runtime_libc(libc_path, target_dir, overwrite=False))
+    if local_libc_available:
+        copied_files.extend(copy_runtime_libc(libc_path, target_dir, overwrite=False))
     log.info(f"libc 下载目录 : {stderr_path(libc_dir)}")
     log.info(f"libc 输出目录 : {stderr_path(target_dir)}")
     if copied_files:
@@ -4019,7 +4372,10 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
             "手动追加包 : " +
             ", ".join(stderr_name(name) for name in normalize_package_name_list(extra_packages))
         )
-        extra_package_copied = download_extra_packages(libc_path, target_dir, extra_packages=extra_packages)
+        if libc_candidate:
+            extra_package_copied = download_extra_packages_from_candidate(libc_candidate, target_dir, extra_packages=extra_packages)
+        else:
+            extra_package_copied = download_extra_packages(libc_path, target_dir, extra_packages=extra_packages)
     if elf_path or extra_needed:
         if elf_path:
             log.info(f"目标 ELF : {stderr_path(elf_path)}")
@@ -4037,14 +4393,24 @@ def download_and_setup_libc(libc_path, elf_path=None, target_dir=None, extra_nee
         else:
             log.info("额外依赖检查 : 目标目录中已存在所需库")
         missing_after_packages = get_missing_needed_libraries(elf_path, target_dir, extra_needed=extra_needed)
-        extra_copied = download_missing_dependencies(
-            libc_path,
-            elf_path,
-            target_dir,
-            missing=missing_after_packages,
-            extra_needed=extra_needed,
-            package_hints=package_hints,
-        )
+        if libc_candidate:
+            extra_copied = download_missing_dependencies_from_candidate(
+                libc_candidate,
+                elf_path,
+                target_dir,
+                missing=missing_after_packages,
+                extra_needed=extra_needed,
+                package_hints=package_hints,
+            )
+        else:
+            extra_copied = download_missing_dependencies(
+                libc_path,
+                elf_path,
+                target_dir,
+                missing=missing_after_packages,
+                extra_needed=extra_needed,
+                package_hints=package_hints,
+            )
         still_missing = get_missing_needed_libraries(elf_path, target_dir, extra_needed=extra_needed)
         if still_missing:
             log.warning(
@@ -4113,6 +4479,376 @@ def prompt_input(message, marker='> '):
         raise EOFError
     return line.rstrip('\r\n')
 
+_PROMPT_TOOLKIT_UNAVAILABLE = object()
+
+def prompt_toolkit_selector_available():
+    if os.environ.get('LIBC_TOOL_DISABLE_TUI') == '1':
+        return False
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    return importlib.util.find_spec('prompt_toolkit') is not None
+
+def truncate_ui_text(text, max_length=96):
+    text = str(text or '').replace('\n', ' ').strip()
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return text[:max_length - 3] + '...'
+
+def selector_window_bounds(total_count, selected_index, window_size):
+    if total_count <= window_size:
+        return 0, total_count
+    half = window_size // 2
+    start = max(0, selected_index - half)
+    end = start + window_size
+    if end > total_count:
+        end = total_count
+        start = end - window_size
+    return start, end
+
+def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情'):
+    if not entries:
+        return None
+    if not prompt_toolkit_selector_available():
+        return _PROMPT_TOOLKIT_UNAVAILABLE
+    try:
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.formatted_text import ANSI
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout
+        from prompt_toolkit.layout.containers import Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+    except Exception as e:
+        log.debug(f"prompt_toolkit 不可用，回退到文本选择: {e}")
+        return _PROMPT_TOOLKIT_UNAVAILABLE
+
+    state = {
+        'selected_index': 0,
+        'result_index': None,
+    }
+    max_visible_items = 10
+
+    def render_text():
+        selected_index = state['selected_index']
+        selected_entry = entries[selected_index]
+        start, end = selector_window_bounds(len(entries), selected_index, max_visible_items)
+        lines = [
+            f"\x1b[1m\x1b[38;5;183m{title}\x1b[0m",
+            "",
+            f"\x1b[38;5;245m{subtitle}\x1b[0m",
+            "",
+        ]
+        if start > 0:
+            lines.append("\x1b[2m  ...\x1b[0m")
+        for index in range(start, end):
+            item = entries[index]
+            selected = index == selected_index
+            prefix = "❯" if selected else " "
+            label_color = "255" if selected else "251"
+            label = truncate_ui_text(item.get('label', ''), max_length=110)
+            line = (
+                f"{prefix} \x1b[{'1;' if selected else ''}3m\x1b[38;5;{label_color}m{label}\x1b[0m"
+            )
+            if selected:
+                line = f"\x1b[7m{line}\x1b[0m"
+            lines.append(line)
+        if end < len(entries):
+            lines.append("\x1b[2m  ...\x1b[0m")
+        lines.extend([
+            "",
+            f"\x1b[2m{selected_index + 1}/{len(entries)} | Enter 确认 | q 取消\x1b[0m",
+            "",
+            f"\x1b[1m\x1b[38;5;120m{detail_title}\x1b[0m",
+        ])
+        for detail_line in selected_entry.get('detail_lines', ()):
+            lines.append(f"  \x1b[3m\x1b[38;5;251m{detail_line}\x1b[0m")
+        return ANSI("\n".join(lines))
+
+    body = Window(
+        content=FormattedTextControl(render_text, focusable=True),
+        always_hide_cursor=True,
+    )
+    kb = KeyBindings()
+
+    @kb.add('up')
+    @kb.add('k')
+    def _move_up(event):
+        state['selected_index'] = (state['selected_index'] - 1) % len(entries)
+        event.app.invalidate()
+
+    @kb.add('down')
+    @kb.add('j')
+    def _move_down(event):
+        state['selected_index'] = (state['selected_index'] + 1) % len(entries)
+        event.app.invalidate()
+
+    @kb.add('pageup')
+    def _page_up(event):
+        state['selected_index'] = max(0, state['selected_index'] - max_visible_items)
+        event.app.invalidate()
+
+    @kb.add('pagedown')
+    def _page_down(event):
+        state['selected_index'] = min(len(entries) - 1, state['selected_index'] + max_visible_items)
+        event.app.invalidate()
+
+    @kb.add('home')
+    def _go_home(event):
+        state['selected_index'] = 0
+        event.app.invalidate()
+
+    @kb.add('end')
+    def _go_end(event):
+        state['selected_index'] = len(entries) - 1
+        event.app.invalidate()
+
+    @kb.add('enter')
+    def _accept(event):
+        state['result_index'] = state['selected_index']
+        event.app.exit()
+
+    @kb.add('q')
+    @kb.add('escape')
+    @kb.add('c-c')
+    def _cancel(event):
+        event.app.exit()
+
+    try:
+        app = Application(
+            layout=Layout(body, focused_element=body),
+            key_bindings=kb,
+            full_screen=True,
+            mouse_support=True,
+        )
+        app.run()
+    except Exception as e:
+        log.debug(f"prompt_toolkit 选择器执行失败，回退到文本选择: {e}")
+        return _PROMPT_TOOLKIT_UNAVAILABLE
+
+    if state['result_index'] is None:
+        return None
+    return entries[state['result_index']].get('value')
+
+def build_libc_selector_entries(matches):
+    entries = []
+    for index, match in enumerate(matches):
+        reason = match.get('reason', match.get('match_type', ''))
+        label = (
+            f"[{index}] {match.get('name', '<unknown>')} | "
+            f"GLIBC {match.get('glibc_ver', 'unknown')} | "
+            f"score {match.get('score', 'N/A')}"
+        )
+        detail_lines = [
+            f"名称: {match.get('name', '<unknown>')}",
+            f"GLIBC: {match.get('glibc_ver', 'unknown')}",
+            f"架构: {match.get('arch', 'unknown')}",
+            f"匹配度: {match.get('score', 'N/A')}",
+            f"原因: {reason}",
+        ]
+        if match.get('info'):
+            detail_lines.append(f"信息: {match['info']}")
+        if match.get('variants', 1) > 1:
+            detail_lines.append(f"子版本: {match['variants']} 个")
+        detail_lines.append(f"路径: {match.get('path', '')}")
+        entries.append({
+            'label': label,
+            'detail_lines': detail_lines,
+            'value': match,
+        })
+    return entries
+
+def show_libc_candidates_for_selection(matches):
+    sys.stdout.write(stdout_heading("libc 候选\n"))
+    for index, match in enumerate(matches):
+        sys.stdout.write(
+            f"[{index}] {match.get('name', '<unknown>')} "
+            f"(GLIBC {match.get('glibc_ver', 'unknown')}, score={match.get('score', 'N/A')})\n"
+        )
+        if match.get('info'):
+            sys.stdout.write(f"    info: {match['info']}\n")
+        sys.stdout.write(f"    path: {match.get('path', '')}\n")
+
+def build_docker_selector_entries(targets):
+    entries = []
+    for index, target in enumerate(targets):
+        if target.get('kind') == 'deployment':
+            kind_label = '容器'
+        elif (target.get('group_size') or 0) > 1:
+            kind_label = '镜像组'
+        else:
+            kind_label = '镜像'
+        label_parts = [f"[{index}] {kind_label} {target.get('display_name', '<unknown>')}"]
+        if target.get('status'):
+            label_parts.append(str(target['status']))
+        if target.get('host_port'):
+            label_parts.append(f"port={target['host_port']}")
+        if target.get('gdb_port'):
+            label_parts.append(f"gdb={target['gdb_port']}")
+        label = " | ".join(label_parts)
+        detail_lines = [
+            f"类型: {kind_label}",
+            f"名称: {target.get('display_name', '<unknown>')}",
+        ]
+        if (target.get('group_size') or 0) > 1:
+            detail_lines.append(f"镜像层数量: {target['group_size']}")
+        if target.get('container_name'):
+            detail_lines.append(f"容器名: {target['container_name']}")
+        if target.get('status'):
+            detail_lines.append(f"状态: {target['status']}")
+        if target.get('image_name'):
+            detail_lines.append(
+                f"镜像: {normalize_docker_image_display_name(target['image_name'])}"
+            )
+        elif target.get('image_id'):
+            detail_lines.append(f"镜像 ID: {target['image_id']}")
+        image_items = target.get('image_items') or ()
+        if image_items:
+            for item in image_items[:6]:
+                detail_lines.append(f"层: {(item.get('image_id') or '')[:19]}")
+            if len(image_items) > 6:
+                detail_lines.append(f"... 其余 {len(image_items) - 6} 层省略")
+        if target.get('host_port'):
+            detail_lines.append(f"服务端口: {target['host_port']}")
+        if target.get('gdb_port'):
+            detail_lines.append(f"GDB 端口: {target['gdb_port']}")
+        if target.get('elf_path'):
+            detail_lines.append(f"ELF: {target['elf_path']}")
+        if target.get('deploy_dir'):
+            detail_lines.append(f"部署目录: {target['deploy_dir']}")
+        entries.append({
+            'label': label,
+            'detail_lines': detail_lines,
+            'value': target,
+        })
+    return entries
+
+def build_port_selector_entries(port_role_label, requested_port, candidate_ports, owner_map, unavailable_reason):
+    entries = []
+    for index, port in enumerate(candidate_ports):
+        owner_text = describe_managed_port_owner(port, owner_map)
+        detail_lines = [
+            f"用途: {port_role_label}",
+            f"候选端口: {port}",
+            "状态: 可用",
+        ]
+        if unavailable_reason:
+            detail_lines.append(f"原端口 {requested_port}: {unavailable_reason}")
+        if owner_text:
+            detail_lines.append(f"同项目历史占用: {owner_text}")
+        entries.append({
+            'label': f"[{index}] {port_role_label} -> {port}",
+            'detail_lines': detail_lines,
+            'value': port,
+        })
+    return entries
+
+def choose_alternate_host_port(requested_port, port_role_label, auto_yes=False, exclude_ports=None, occupied_reason=None):
+    exclude_ports = {int(item) for item in (exclude_ports or ())}
+    owner_map = collect_managed_docker_port_owners()
+    suggestions = scan_available_tcp_ports(
+        max(1, int(requested_port)),
+        count=8,
+        exclude_ports=exclude_ports,
+        limit=512,
+    )
+    if not suggestions:
+        log.error(f"{port_role_label}未找到可用端口，请手动使用 --port/--gdb-port 指定。")
+        sys.exit(1)
+
+    reason_text = occupied_reason or f"已被占用，建议改用其他宿主机端口"
+    if auto_yes:
+        return suggestions[0]
+
+    tui_selected = try_prompt_toolkit_selector(
+        f'选择{port_role_label}',
+        f'{port_role_label}{requested_port} {reason_text}。上下键选择新端口，Enter 确认，q 取消。',
+        build_port_selector_entries(
+            port_role_label,
+            requested_port,
+            suggestions,
+            owner_map,
+            reason_text,
+        ),
+        detail_title='端口详情',
+    )
+    if tui_selected is not _PROMPT_TOOLKIT_UNAVAILABLE:
+        if tui_selected is None:
+            log.info("已取消启动。")
+            sys.exit(0)
+        return int(tui_selected)
+
+    sys.stdout.write(stdout_heading(f"{port_role_label}候选端口\n"))
+    for index, port in enumerate(suggestions):
+        owner_text = describe_managed_port_owner(port, owner_map)
+        detail = f"  {owner_text}" if owner_text else ""
+        sys.stdout.write(f"[{index}] {port}{detail}\n")
+    while True:
+        try:
+            choice = prompt_input(
+                f"\n{port_role_label}{requested_port} {reason_text}。"
+                f"请输入新端口，回车使用 {suggestions[0]}，输入 q 取消。"
+            ).strip()
+        except EOFError:
+            log.info("已取消启动。")
+            sys.exit(1)
+        if not choice:
+            return int(suggestions[0])
+        if choice.lower() in {'q', 'quit', 'exit'}:
+            log.info("已取消启动。")
+            sys.exit(0)
+        try:
+            selected_port = int(choice)
+        except ValueError:
+            log.warning("请输入有效端口号。")
+            continue
+        if selected_port < 1 or selected_port > 65535:
+            log.warning("端口号必须在 1-65535 之间。")
+            continue
+        if selected_port in exclude_ports:
+            log.warning(f"端口 {selected_port} 与当前 Docker 配置冲突，请重新选择。")
+            continue
+        ok, detail = local_tcp_port_available(selected_port)
+        if not ok:
+            log.warning(f"端口 {selected_port} 不可用: {detail}")
+            continue
+        return selected_port
+
+def resolve_docker_host_ports(service_port, enable_gdbserver=False, gdb_port=None, auto_yes=False):
+    selected_service_port = int(service_port)
+    selected_gdb_port = int(gdb_port) if gdb_port is not None else 1234
+
+    service_ok, service_detail = local_tcp_port_available(selected_service_port)
+    if not service_ok:
+        selected_service_port = choose_alternate_host_port(
+            selected_service_port,
+            '服务端口',
+            auto_yes=auto_yes,
+            exclude_ports=set(),
+            occupied_reason=service_detail,
+        )
+
+    if enable_gdbserver:
+        gdb_reason = None
+        if selected_gdb_port == selected_service_port:
+            gdb_reason = '与服务端口冲突'
+        else:
+            gdb_ok, gdb_detail = local_tcp_port_available(selected_gdb_port)
+            if not gdb_ok:
+                gdb_reason = gdb_detail
+        if gdb_reason:
+            selected_gdb_port = choose_alternate_host_port(
+                selected_gdb_port,
+                'GDB 端口',
+                auto_yes=auto_yes,
+                exclude_ports={selected_service_port},
+                occupied_reason=gdb_reason,
+            )
+
+    return selected_service_port, selected_gdb_port
+
 def exit_missing_pwntools():
     message = f"缺少 pwntools，当前功能不可用: {PWN_IMPORT_ERROR}"
     log.failure(message)
@@ -4150,11 +4886,24 @@ def require_existing_elf(path, description):
         sys.exit(1)
     return file_path
 
-def log_patch_completion(target_elf, plan):
+def cli_auto_yes(args):
+    return bool(getattr(args, 'yes', False))
+
+@contextmanager
+def quiet_cli_progress(enabled, level='warning'):
+    if enabled:
+        with context.local(log_level=level):
+            yield
+        return
+    yield
+
+def log_patch_completion(target_elf, plan, verbose=True):
     log.success(
         f"Patch 完成: {stderr_path(target_elf)} "
         f"(mode={stderr_choice(plan['mode'])}, loader={stderr_path(plan['loader_path'])})"
     )
+    if not verbose:
+        return
     log.info(
         "  interpreter: " + format_patch_transition(
             plan['original_state'].get('interpreter'),
@@ -4170,22 +4919,1375 @@ def log_patch_completion(target_elf, plan):
         )
     )
 
+def safe_name_fragment(value):
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', str(value or '').strip()) or 'pwn'
+
+def shell_join_args(args):
+    return " ".join(shlex.quote(str(item)) for item in args)
+
+def docker_template_root():
+    local_root = os.path.abspath(LOCAL_DOCKER_TEMPLATE_ROOT)
+    if os.path.isdir(local_root):
+        return local_root
+    return os.path.abspath(DOCKER_TEMPLATE_ROOT)
+
+def docker_template_deploy_dir(template_name):
+    return os.path.join(docker_template_root(), template_name, 'deploy')
+
+def resolve_docker_template(template_name):
+    deploy_dir = docker_template_deploy_dir(template_name)
+    if not os.path.isdir(deploy_dir):
+        raise RuntimeError(f"Docker 模板不存在: {deploy_dir}")
+    return deploy_dir
+
+def default_docker_deploy_dir(elf_path):
+    elf_dir = os.path.dirname(os.path.abspath(elf_path))
+    elf_name = safe_name_fragment(os.path.basename(elf_path))
+    return os.path.join(elf_dir, f'.libc_tool_docker_{elf_name}')
+
+def docker_base_image_for_runtime(runtime_dir, libc_candidate=None, override=None):
+    if override:
+        return override
+    runtime_libc = find_library_artifact(runtime_dir, 'libc.so.6', require_dynamic=True)
+    runtime_ubuntu_release = None
+    if runtime_libc:
+        runtime_ubuntu_release = infer_ubuntu_release_from_libc(runtime_libc)
+    if libc_candidate:
+        distro = libc_candidate.get('package_distro')
+        release = libc_candidate.get('package_release')
+        if distro == 'ubuntu' and release:
+            return f'ubuntu:{release}'
+        if runtime_ubuntu_release:
+            return f'ubuntu:{runtime_ubuntu_release}'
+        if distro == 'debian':
+            codename = normalize_debian_release(release)
+            if codename and codename not in {'sid', 'testing'}:
+                return f'debian:{codename}'
+            return 'debian:stable'
+    if runtime_libc:
+        if runtime_ubuntu_release:
+            return f'ubuntu:{runtime_ubuntu_release}'
+        debian_release = normalize_debian_release(infer_debian_release_from_libc(runtime_libc))
+        if debian_release and debian_release not in {'sid', 'testing'}:
+            return f'debian:{debian_release}'
+    return 'ubuntu:20.04'
+
+def docker_compose_program():
+    docker_path = shutil.which('docker')
+    if docker_path:
+        try:
+            result = subprocess.run(
+                [docker_path, 'compose', 'version'],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            result = None
+        if result is not None and result.returncode == 0:
+            return [docker_path, 'compose']
+    docker_compose_path = shutil.which('docker-compose')
+    if docker_compose_path:
+        return [docker_compose_path]
+    raise RuntimeError("未找到 docker compose 或 docker-compose")
+
+def docker_program():
+    docker_path = shutil.which('docker')
+    if docker_path:
+        return docker_path
+    raise RuntimeError("未找到 docker")
+
+def run_docker_cli(command, cwd=None, timeout=30):
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except Exception as e:
+        raise RuntimeError(f"{shell_join_args(command)} 执行失败: {e}") from e
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or '').strip()
+        if detail:
+            raise RuntimeError(
+                f"{shell_join_args(command)} 失败 (exit={result.returncode}): {detail}"
+            )
+        raise RuntimeError(f"{shell_join_args(command)} 失败 (exit={result.returncode})")
+    return result.stdout
+
+def docker_resource_labels(config):
+    labels = [(DOCKER_MANAGED_LABEL, '1')]
+    if config.get('bundle_name'):
+        labels.append(('libc_tool.bundle_name', config['bundle_name']))
+    for label_key, config_key in (
+        ('libc_tool.host_port', 'host_port'),
+        ('libc_tool.gdb_port', 'gdb_port'),
+        ('libc_tool.template', 'template_name'),
+        ('libc_tool.base_image', 'base_image'),
+    ):
+        value = config.get(config_key, '')
+        if label_key == 'libc_tool.gdb_port' and not config.get('enable_gdbserver'):
+            value = ''
+        labels.append((label_key, str(value or '')))
+    for rel_label, legacy_label, rel_key, host_key in (
+        ('libc_tool.elf_rel', 'libc_tool.elf_host', 'elf_path_rel', 'elf_path_host'),
+        ('libc_tool.challenge_dir_rel', 'libc_tool.challenge_dir_host', 'challenge_dir_rel', 'challenge_dir_host'),
+        ('libc_tool.runtime_dir_rel', 'libc_tool.runtime_dir_host', 'runtime_dir_rel', 'runtime_dir_host'),
+    ):
+        rel_value = normalize_portable_relpath(config.get(rel_key, ''))
+        host_value = str(config.get(host_key, '') or '').strip()
+        if rel_value:
+            labels.append((rel_label, rel_value))
+        elif host_value:
+            labels.append((legacy_label, host_value))
+    return labels
+
+def docker_repo_name(image_name):
+    image_name = str(image_name or '').strip()
+    if not image_name:
+        return ''
+    if ':' in image_name:
+        return image_name.rsplit(':', 1)[0]
+    return image_name
+
+def is_managed_docker_image_name(image_name):
+    return docker_repo_name(image_name).startswith(DOCKER_MANAGED_IMAGE_PREFIX)
+
+def normalize_docker_image_display_name(image_name):
+    image_name = str(image_name or '').strip()
+    if not image_name:
+        return '<none>'
+    if image_name.endswith(':latest'):
+        return image_name[:-len(':latest')]
+    return image_name
+
+def docker_deploy_dir_from_labels(labels):
+    labels = labels or {}
+    working_dir = labels.get('com.docker.compose.project.working_dir')
+    if working_dir:
+        return os.path.abspath(working_dir)
+    config_files = labels.get('com.docker.compose.project.config_files')
+    if config_files:
+        first = config_files.split(',', 1)[0].strip()
+        if first:
+            return os.path.dirname(os.path.abspath(first))
+    deploy_dir = labels.get('libc_tool.deploy_dir')
+    if deploy_dir:
+        return os.path.abspath(deploy_dir)
+    return None
+
+def docker_label_path(labels, deploy_dir, rel_key, legacy_key):
+    labels = labels or {}
+    rel_value = normalize_portable_relpath(labels.get(rel_key) or '')
+    if rel_value and deploy_dir:
+        return os.path.abspath(os.path.join(deploy_dir, rel_value))
+    host_value = str(labels.get(legacy_key) or '').strip()
+    if host_value:
+        return os.path.abspath(host_value)
+    return ''
+
+def docker_host_port_map(container_info):
+    port_map = {}
+    ports = ((container_info.get('NetworkSettings') or {}).get('Ports') or {})
+    for container_port, bindings in ports.items():
+        if not bindings:
+            continue
+        values = []
+        for binding in bindings:
+            host_port = (binding or {}).get('HostPort')
+            if host_port:
+                values.append(str(host_port))
+        if values:
+            port_map[container_port] = ",".join(values)
+    return port_map
+
+def sort_ports_for_display(values):
+    normalized = []
+    for value in values or ():
+        value = str(value or '').strip()
+        if not value:
+            continue
+        if value.isdigit():
+            normalized.append((0, int(value), value))
+        else:
+            normalized.append((1, value, value))
+    normalized.sort()
+    return [item[2] for item in normalized]
+
+def build_grouped_image_target(image_items):
+    first = image_items[0]
+    deploy_dir = first.get('deploy_dir') or ''
+    deploy_name = os.path.basename(os.path.normpath(deploy_dir)) if deploy_dir else ''
+    image_ids = [item.get('image_id') or '' for item in image_items if item.get('image_id')]
+    image_name = ''
+    for item in image_items:
+        if item.get('image_name'):
+            image_name = item['image_name']
+            break
+    port_values = sort_ports_for_display({item.get('host_port') for item in image_items if item.get('host_port')})
+    gdb_values = sort_ports_for_display({item.get('gdb_port') for item in image_items if item.get('gdb_port')})
+    display_name = deploy_name or normalize_docker_image_display_name(image_name or (image_ids[0] if image_ids else '<none>'))
+    return {
+        'kind': 'image',
+        'display_name': display_name,
+        'container_id': '',
+        'container_name': '',
+        'image_id': image_ids[0] if image_ids else '',
+        'image_ids': image_ids,
+        'image_items': image_items,
+        'image_name': image_name,
+        'status': 'unused',
+        'deploy_dir': deploy_dir,
+        'elf_path': first.get('elf_path') or '',
+        'challenge_dir': first.get('challenge_dir') or '',
+        'runtime_dir': first.get('runtime_dir') or '',
+        'host_port': ",".join(port_values),
+        'gdb_port': ",".join(gdb_values),
+        'group_size': len(image_items),
+    }
+
+def order_image_items_for_removal(image_items):
+    by_id = {
+        item.get('image_id'): item
+        for item in image_items
+        if item.get('image_id')
+    }
+    depth_cache = {}
+
+    def depth_for(image_id, seen=None):
+        if not image_id:
+            return 0
+        if image_id in depth_cache:
+            return depth_cache[image_id]
+        seen = set(seen or ())
+        if image_id in seen:
+            return 0
+        seen.add(image_id)
+        item = by_id.get(image_id) or {}
+        parent_id = item.get('parent_id') or ''
+        depth = 0
+        if parent_id in by_id:
+            depth = depth_for(parent_id, seen) + 1
+        depth_cache[image_id] = depth
+        return depth
+
+    return sorted(
+        image_items,
+        key=lambda item: (
+            -depth_for(item.get('image_id') or ''),
+            item.get('image_id') or '',
+        ),
+    )
+
+def remove_image_refs(image_items):
+    docker_path = docker_program()
+    errors = []
+    removed_ids = []
+    for item in order_image_items_for_removal(image_items):
+        image_ref = item.get('image_name') or item.get('image_id')
+        if not image_ref:
+            continue
+        try:
+            run_docker_cli([docker_path, 'image', 'rm', image_ref], timeout=60)
+            removed_ids.append(item.get('image_id') or image_ref)
+            continue
+        except RuntimeError:
+            pass
+        try:
+            run_docker_cli([docker_path, 'image', 'rm', '-f', image_ref], timeout=60)
+            removed_ids.append(item.get('image_id') or image_ref)
+        except RuntimeError as e:
+            errors.append(str(e))
+    return {
+        'removed_ids': removed_ids,
+        'errors': errors,
+    }
+
+def collect_libc_tool_docker_targets():
+    docker_path = docker_program()
+    container_targets = []
+    used_image_ids = set()
+
+    raw_container_ids = list(dict.fromkeys(
+        run_docker_cli([docker_path, 'ps', '-aq'], timeout=20).split()
+    ))
+    if raw_container_ids:
+        container_items = json.loads(
+            run_docker_cli([docker_path, 'inspect'] + raw_container_ids, timeout=60)
+        )
+        for item in container_items:
+            name = str(item.get('Name') or '').lstrip('/')
+            labels = ((item.get('Config') or {}).get('Labels') or {})
+            managed = (
+                labels.get(DOCKER_MANAGED_LABEL) == '1'
+                or name.startswith(DOCKER_MANAGED_CONTAINER_PREFIX)
+            )
+            if not managed:
+                continue
+            ports = docker_host_port_map(item)
+            image_name = (item.get('Config') or {}).get('Image') or ''
+            image_id = item.get('Image') or ''
+            if image_id:
+                used_image_ids.add(image_id)
+            deploy_dir = docker_deploy_dir_from_labels(labels)
+            container_targets.append({
+                'kind': 'deployment',
+                'display_name': name or image_name or (item.get('Id') or '')[:12],
+                'container_id': item.get('Id') or '',
+                'container_name': name,
+                'image_id': image_id,
+                'image_name': image_name,
+                'status': ((item.get('State') or {}).get('Status') or '').strip(),
+                'deploy_dir': deploy_dir,
+                'bundle_name': labels.get('libc_tool.bundle_name') or '',
+                'elf_path': docker_label_path(labels, deploy_dir, 'libc_tool.elf_rel', 'libc_tool.elf_host'),
+                'challenge_dir': docker_label_path(labels, deploy_dir, 'libc_tool.challenge_dir_rel', 'libc_tool.challenge_dir_host'),
+                'runtime_dir': docker_label_path(labels, deploy_dir, 'libc_tool.runtime_dir_rel', 'libc_tool.runtime_dir_host'),
+                'host_port': labels.get('libc_tool.host_port') or ports.get('1337/tcp') or '',
+                'gdb_port': labels.get('libc_tool.gdb_port') or ports.get('1234/tcp') or '',
+            })
+
+    raw_image_targets = []
+    raw_image_ids = list(dict.fromkeys(
+        run_docker_cli([docker_path, 'image', 'ls', '-aq'], timeout=20).split()
+    ))
+    if raw_image_ids:
+        image_items = json.loads(
+            run_docker_cli([docker_path, 'image', 'inspect'] + raw_image_ids, timeout=60)
+        )
+        for item in image_items:
+            labels = ((item.get('Config') or {}).get('Labels') or {})
+            repo_tags = [tag for tag in (item.get('RepoTags') or []) if tag and tag != '<none>:<none>']
+            managed_repo_tags = [tag for tag in repo_tags if is_managed_docker_image_name(tag)]
+            managed = labels.get(DOCKER_MANAGED_LABEL) == '1' or bool(managed_repo_tags)
+            if not managed:
+                continue
+            image_id = item.get('Id') or ''
+            if image_id in used_image_ids:
+                continue
+            deploy_dir = docker_deploy_dir_from_labels(labels)
+            raw_image_targets.append({
+                'kind': 'image',
+                'display_name': normalize_docker_image_display_name(
+                    managed_repo_tags[0] if managed_repo_tags else (repo_tags[0] if repo_tags else image_id[:19])
+                ),
+                'container_id': '',
+                'container_name': '',
+                'image_id': image_id,
+                'parent_id': item.get('Parent') or '',
+                'image_name': managed_repo_tags[0] if managed_repo_tags else (repo_tags[0] if repo_tags else ''),
+                'status': 'unused',
+                'deploy_dir': deploy_dir,
+                'bundle_name': labels.get('libc_tool.bundle_name') or '',
+                'elf_path': docker_label_path(labels, deploy_dir, 'libc_tool.elf_rel', 'libc_tool.elf_host'),
+                'challenge_dir': docker_label_path(labels, deploy_dir, 'libc_tool.challenge_dir_rel', 'libc_tool.challenge_dir_host'),
+                'runtime_dir': docker_label_path(labels, deploy_dir, 'libc_tool.runtime_dir_rel', 'libc_tool.runtime_dir_host'),
+                'host_port': labels.get('libc_tool.host_port') or '',
+                'gdb_port': labels.get('libc_tool.gdb_port') or '',
+            })
+
+    grouped_image_targets = []
+    image_groups = {}
+    for item in raw_image_targets:
+        group_key = (
+            item.get('deploy_dir')
+            or item.get('bundle_name')
+            or item.get('image_name')
+            or item.get('image_id')
+            or item.get('display_name')
+        )
+        image_groups.setdefault(group_key, []).append(item)
+    for group_items in image_groups.values():
+        grouped_image_targets.append(build_grouped_image_target(group_items))
+
+    container_targets.sort(key=lambda item: item['display_name'])
+    grouped_image_targets.sort(key=lambda item: item['display_name'])
+    return container_targets + grouped_image_targets
+
+def show_libc_tool_docker_targets(targets):
+    sys.stdout.write(stdout_heading("libc_tool Docker 资源\n"))
+    for index, target in enumerate(targets):
+        if target.get('kind') == 'deployment':
+            kind_label = 'deployment'
+        elif (target.get('group_size') or 0) > 1:
+            kind_label = 'image-group'
+        else:
+            kind_label = 'image'
+        summary_parts = []
+        if target.get('status'):
+            summary_parts.append(target['status'])
+        if target.get('host_port'):
+            summary_parts.append(f"port={target['host_port']}")
+        if target.get('gdb_port'):
+            summary_parts.append(f"gdb={target['gdb_port']}")
+        if target.get('image_name'):
+            summary_parts.append(f"image={normalize_docker_image_display_name(target['image_name'])}")
+        if (target.get('group_size') or 0) > 1:
+            summary_parts.append(f"layers={target['group_size']}")
+        headline = f"[{index}] {kind_label} {target['display_name']}"
+        if summary_parts:
+            headline += " (" + ", ".join(summary_parts) + ")"
+        sys.stdout.write(headline + "\n")
+        if target.get('elf_path'):
+            sys.stdout.write(f"    elf: {target['elf_path']}\n")
+        if target.get('deploy_dir'):
+            sys.stdout.write(f"    deploy: {target['deploy_dir']}\n")
+
+def choose_libc_tool_docker_target(targets, auto_yes=False):
+    if not targets:
+        return None
+    if auto_yes:
+        if len(targets) == 1:
+            return targets[0]
+        log.error("--yes 只能在唯一一个 Docker 资源时自动选择；请显式传入 ELF/--deploy-dir，或手动选择。")
+        sys.exit(1)
+    tui_selected = try_prompt_toolkit_selector(
+        '选择 Docker 资源',
+        '上下键选择要销毁的容器或镜像，Enter 确认，q 取消。',
+        build_docker_selector_entries(targets),
+        detail_title='Docker 详情',
+    )
+    if tui_selected is not _PROMPT_TOOLKIT_UNAVAILABLE:
+        if tui_selected is None:
+            sys.exit(0)
+        return tui_selected
+    show_libc_tool_docker_targets(targets)
+    while True:
+        try:
+            choice = prompt_input(
+                f"\n请选择要销毁的 Docker 资源 (0-{len(targets)-1})，默认 0，输入 q 取消。"
+            ).strip()
+        except EOFError:
+            log.error("输入结束，已取消销毁。")
+            sys.exit(1)
+        if not choice:
+            return targets[0]
+        if choice.lower() in {'q', 'quit', 'exit'}:
+            log.info("已取消销毁。")
+            sys.exit(0)
+        try:
+            index = int(choice)
+        except ValueError:
+            log.warning("请输入有效编号。")
+            continue
+        if 0 <= index < len(targets):
+            selected_target = targets[index]
+            log.info(f"已选择 Docker 资源: {stderr_choice(selected_target.get('display_name', '<unknown>'))}")
+            return selected_target
+        log.warning(f"编号超出范围，请输入 0 到 {len(targets)-1}。")
+
+def destroy_libc_tool_docker_target(target):
+    deploy_dir = target.get('deploy_dir')
+    compose_file = os.path.join(deploy_dir, 'docker-compose.yaml') if deploy_dir else None
+    if compose_file and os.path.exists(compose_file):
+        run_docker_compose_action(
+            deploy_dir,
+            ['down', '--rmi', 'all', '--remove-orphans'],
+        )
+        post_targets = collect_libc_tool_docker_targets()
+        image_group_targets = [
+            item for item in post_targets
+            if item.get('kind') == 'image' and item.get('deploy_dir') == deploy_dir
+        ]
+        removal_errors = []
+        removed_ids = []
+        for image_target in image_group_targets:
+            removal = remove_image_refs(image_target.get('image_items') or ())
+            removed_ids.extend(removal.get('removed_ids', ()))
+            removal_errors.extend(removal.get('errors', ()))
+        return {
+            'mode': 'compose',
+            'deploy_dir': deploy_dir,
+            'container_removed': True,
+            'image_removed': not removal_errors,
+            'image_error': "\n".join(removal_errors),
+            'removed_ids': removed_ids,
+        }
+
+    if target.get('kind') == 'deployment' and target.get('container_id'):
+        docker_path = docker_program()
+        run_docker_cli([docker_path, 'rm', '-f', target['container_id']], timeout=60)
+    image_items = target.get('image_items') or ()
+    if image_items:
+        removal = remove_image_refs(image_items)
+        image_removed = not removal.get('errors')
+        image_error = "\n".join(removal.get('errors', ()))
+        removed_ids = removal.get('removed_ids', ())
+    else:
+        image_ref = target.get('image_name') or target.get('image_id')
+        if image_ref:
+            removal = remove_image_refs([{
+                'image_id': target.get('image_id') or image_ref,
+                'image_name': target.get('image_name') or '',
+                'parent_id': '',
+            }])
+            image_removed = not removal.get('errors')
+            image_error = "\n".join(removal.get('errors', ()))
+            removed_ids = removal.get('removed_ids', ())
+        else:
+            image_removed = True
+            image_error = ''
+            removed_ids = ()
+    return {
+        'mode': 'direct',
+        'deploy_dir': deploy_dir,
+        'container_removed': target.get('kind') == 'image' or bool(target.get('container_id')),
+        'image_removed': image_removed,
+        'image_error': image_error,
+        'removed_ids': removed_ids,
+    }
+
+def yaml_quote(value):
+    text_value = str(value)
+    return '"' + text_value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+def relative_container_path(root_path, file_path, container_root):
+    rel_path = os.path.relpath(os.path.abspath(file_path), os.path.abspath(root_path))
+    rel_path = rel_path.replace(os.sep, '/')
+    return container_root if rel_path == '.' else f"{container_root}/{rel_path}"
+
+def docker_exec_target_path(elf_container_path):
+    return f"/tmp/libc_tool_exec_{os.path.basename(elf_container_path)}"
+
+def render_docker_run_script():
+    return """#!/bin/bash
+set -e
+
+if [ ! -z "$ENABLE_POW" ]
+then
+    if [ "$ENABLE_POW" == "1" ]
+    then
+        echo "=================proof-of-work================="
+        echo ""
+        rand_str=$(head -c 27 /dev/urandom | base64)
+        hash_value=$(echo -n "$rand_str" | sha256sum - | cut -c 1-64)
+        frontend=$(echo "$rand_str" | cut -c -4 )
+        backend=$(echo "$rand_str" | cut -c 5- )
+        prompt="sha256(XXXX + \\"${backend}\\") == ${hash_value}"
+        echo $prompt
+        echo -n "Gime me XXXX: "
+
+        read -t 300 -r input_hash
+
+        if [ "$input_hash" != "$frontend" ]
+        then
+            echo "Proof of work failed!"
+            exit 2
+        fi
+    fi
+fi
+
+unset ENABLE_POW
+
+if [ ! -z "$FLAG" ]
+then
+    if [ "$(cat /home/ctf/flag)" != "$FLAG" ]
+    then
+        echo $FLAG > /home/ctf/flag
+        chmod 644 /home/ctf/flag
+    fi
+fi
+
+unset FLAG
+
+launch_script=${LIBC_TOOL_LAUNCH_SCRIPT:-/run_challenge.sh}
+gdbserver_enabled=${LIBC_TOOL_GDBSERVER:-0}
+gdb_port=${LIBC_TOOL_GDB_PORT:-1234}
+gdb_prepare=${LIBC_TOOL_GDB_PREPARE:-}
+gdb_target=${LIBC_TOOL_GDB_TARGET:-}
+
+if [ ! -x "$launch_script" ]
+then
+    echo "launch script not found: $launch_script" >&2
+    exit 2
+fi
+
+if [ "$gdbserver_enabled" = "1" ]
+then
+    if [ ! -z "$gdb_prepare" ]
+    then
+        if [ ! -x "$gdb_prepare" ]
+        then
+            echo "gdb prepare script not found: $gdb_prepare" >&2
+            exit 2
+        fi
+        "$gdb_prepare"
+    fi
+    if [ ! -z "$gdb_target" ]
+    then
+        if [ ! -x "$gdb_target" ]
+        then
+            echo "gdb target not found: $gdb_target" >&2
+            exit 2
+        fi
+        exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" gdbserver --once "0.0.0.0:${gdb_port}" "$gdb_target"
+    fi
+    exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" gdbserver --once "0.0.0.0:${gdb_port}" "$launch_script"
+fi
+
+exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" "$launch_script"
+"""
+
+def render_docker_challenge_script(challenge_dir, command):
+    return f"""#!/bin/bash
+set -e
+
+challenge_dir={shlex.quote(challenge_dir)}
+prepare_script=/prepare_gdb_target.sh
+
+if [ ! -d "$challenge_dir" ]
+then
+    echo "challenge dir not found: $challenge_dir" >&2
+    exit 2
+fi
+
+if [ -x "$prepare_script" ]
+then
+    "$prepare_script"
+fi
+
+cd "$challenge_dir"
+{command}
+"""
+
+def render_docker_gdb_prepare_script(runtime_root, elf_container_path, exec_target_path):
+    return f"""#!/bin/bash
+set -e
+
+runtime_root={shlex.quote(runtime_root)}
+overlay_dir=${{LIBC_TOOL_RUNTIME_OVERLAY:-/tmp/libc_tool_runtime_extra}}
+elf_source={shlex.quote(elf_container_path)}
+exec_target={shlex.quote(exec_target_path)}
+
+mkdir -p "$overlay_dir"
+find "$overlay_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +
+
+cp -f "$elf_source" "$exec_target"
+chmod 755 "$exec_target"
+
+if [ ! -d "$runtime_root" ]
+then
+    exit 0
+fi
+
+find "$runtime_root" \\( -type f -o -type l \\) -print0 | while IFS= read -r -d '' lib_path
+do
+    base=$(basename "$lib_path")
+    case "$base" in
+        ld.so|ld-linux*|libc.so*|libpthread.so*|libm.so*|libdl.so*|librt.so*|libutil.so*|libnsl.so*|libresolv.so*|libanl.so*|libBrokenLocale.so*|libthread_db.so*|libSegFault.so*|libmemusage.so*|libpcprofile.so*|libcrypt.so*)
+            continue
+            ;;
+    esac
+    cp -Lf "$lib_path" "$overlay_dir/$base"
+done
+"""
+
+def gdb_quote_string(value):
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+def render_docker_gdb_script(
+    elf_bundle_rel,
+    runtime_bundle_rel,
+    challenge_bundle_rel,
+    enable_gdbserver=False,
+    gdb_port=1234,
+    host_port=None,
+    remote_host='127.0.0.1',
+    remote_exec_file='/tmp/libc_tool_exec_pwn',
+):
+    lines = [
+        "# generated by libc_tool docker",
+        "set pagination off",
+        "set confirm off",
+        "set breakpoint pending on",
+        "set follow-fork-mode parent",
+        "set detach-on-fork off",
+        "set print thread-events off",
+        "python",
+        "import os",
+        "import gdb",
+        "",
+        "def _libc_tool_gdb_quote(value):",
+        "    return '\"' + str(value).replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"') + '\"'",
+        "",
+        "def _libc_tool_run(command):",
+        "    try:",
+        "        gdb.execute(command)",
+        "    except gdb.error as exc:",
+        "        gdb.write(f\"libc_tool: {exc}\\n\", gdb.STDERR)",
+        "",
+        "deploy_dir = os.path.realpath(os.environ.get('LIBC_TOOL_DEPLOY_DIR') or os.getcwd())",
+        f"challenge_dir = os.path.join(deploy_dir, {normalize_portable_relpath(challenge_bundle_rel)!r})",
+        f"runtime_dir = os.path.join(deploy_dir, {normalize_portable_relpath(runtime_bundle_rel)!r})",
+        f"elf_path = os.path.join(deploy_dir, {normalize_portable_relpath(elf_bundle_rel)!r})",
+        "sysroot_dir = os.path.join(deploy_dir, '.gdb_sysroot')",
+        "solib_search_paths = ':'.join([runtime_dir, challenge_dir])",
+        "_libc_tool_run(f'set sysroot {_libc_tool_gdb_quote(sysroot_dir)}')",
+        "_libc_tool_run(f'set solib-search-path {_libc_tool_gdb_quote(solib_search_paths)}')",
+        "_libc_tool_run(f'set debug-file-directory {_libc_tool_gdb_quote(runtime_dir)}')",
+        "_libc_tool_run(f'directory {_libc_tool_gdb_quote(challenge_dir)}')",
+        "_libc_tool_run(f'set substitute-path {_libc_tool_gdb_quote(\"/challenge\")} {_libc_tool_gdb_quote(challenge_dir)}')",
+        "_libc_tool_run(f'set substitute-path {_libc_tool_gdb_quote(\"/runtime\")} {_libc_tool_gdb_quote(runtime_dir)}')",
+        "_libc_tool_run(f'set substitute-path {_libc_tool_gdb_quote(\"/tmp/libc_tool_runtime_extra\")} {_libc_tool_gdb_quote(runtime_dir)}')",
+        "_libc_tool_run(f'file {_libc_tool_gdb_quote(elf_path)}')",
+        "end",
+    ]
+    if enable_gdbserver:
+        remote_target = f"{remote_host}:{int(gdb_port)}"
+        if host_port:
+            auto_message = (
+                f"libc_tool: gdbserver not ready yet. "
+                f"keep one client connected to 127.0.0.1:{int(host_port)}, "
+                f"then run libc_tool_remote.\n"
+            )
+        else:
+            auto_message = "libc_tool: gdbserver not ready yet. Run libc_tool_remote later.\n"
+        lines.extend([
+            f"set remote exec-file {gdb_quote_string(remote_exec_file)}",
+            "define libc_tool_remote",
+            f"  target remote {remote_target}",
+            "end",
+            "document libc_tool_remote",
+            f"Connect to libc_tool gdbserver at {remote_target}.",
+            "end",
+            "python",
+            "import gdb",
+            "try:",
+            f"    gdb.execute({('target remote ' + remote_target)!r})",
+            "except gdb.error:",
+            f"    gdb.write({auto_message!r})",
+            "end",
+        ])
+    else:
+        lines.append("# regenerate with --gdbserver if you want target remote preconfigured")
+    lines.append("")
+    return "\n".join(lines)
+
+def render_docker_gdb_wrapper():
+    return """#!/bin/bash
+set -e
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export LIBC_TOOL_DEPLOY_DIR="$script_dir"
+
+exec gdb -q -x "$script_dir/debug.gdb" "$@"
+"""
+
+def render_dockerfile(base_image, template_name, enable_gdbserver=False):
+    header = f"# generated by libc_tool docker, based on {template_name}\n"
+    alpine_packages = "socat bash util-linux coreutils shadow"
+    debian_packages = "socat bash util-linux coreutils"
+    if enable_gdbserver:
+        alpine_packages += " gdbserver"
+        debian_packages += " gdbserver"
+    socat_listen = "tcp-l:1337,reuseaddr" if enable_gdbserver else "tcp-l:1337,reuseaddr,fork"
+    socat_exec = "exec:/run_pwn.sh"
+    if base_image.startswith('alpine:'):
+        return header + f"""FROM {base_image}
+
+USER root
+
+RUN apk update && \\
+    apk add --no-cache {alpine_packages} && \\
+    if ! id -u ctf >/dev/null 2>&1; then adduser -D -s /bin/sh ctf; fi
+
+WORKDIR /home/ctf
+
+COPY ./flag ./flag
+COPY ./run_pwn.sh /
+COPY ./run_challenge.sh /
+COPY ./prepare_gdb_target.sh /
+
+RUN chmod 644 ./flag && \\
+    chmod 755 /run_pwn.sh && \\
+    chmod 755 /run_challenge.sh && \\
+    chmod 755 /prepare_gdb_target.sh && \\
+    chown -R root:root .
+
+EXPOSE 1337
+
+CMD socat {socat_listen} {socat_exec}
+"""
+    return header + f"""FROM {base_image}
+
+USER root
+
+RUN apt-get update && \\
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {debian_packages} && \\
+    rm -rf /var/lib/apt/lists/* && \\
+    if ! id -u ctf >/dev/null 2>&1; then useradd -m -s /bin/sh ctf; fi
+
+WORKDIR /home/ctf
+
+COPY ./flag ./flag
+COPY ./run_pwn.sh /
+COPY ./run_challenge.sh /
+COPY ./prepare_gdb_target.sh /
+
+RUN chmod 644 ./flag && \\
+    chmod 755 /run_pwn.sh && \\
+    chmod 755 /run_challenge.sh && \\
+    chmod 755 /prepare_gdb_target.sh && \\
+    chown -R root:root .
+
+EXPOSE 1337
+
+CMD socat {socat_listen} {socat_exec}
+"""
+
+def render_docker_compose(config):
+    resource_labels = docker_resource_labels(config)
+    challenge_mount = './' + normalize_portable_relpath(config['challenge_dir_rel'])
+    runtime_mount = './' + normalize_portable_relpath(config['runtime_dir_rel'])
+    lines = [
+        "# docker-compose.yaml generated by libc_tool docker",
+        'version: "3"',
+        "services:",
+        "  pwn:",
+        "    build:",
+        "      context: .",
+        "      labels:",
+    ]
+    for key, value in resource_labels:
+        lines.append(f"        {key}: {yaml_quote(value)}")
+    lines.extend([
+        f"    container_name: {yaml_quote(config['container_name'])}",
+        f"    working_dir: {yaml_quote(config['challenge_root'])}",
+        "    restart: unless-stopped",
+        "    labels:",
+    ])
+    for key, value in resource_labels:
+        lines.append(f"      {key}: {yaml_quote(value)}")
+    lines.extend([
+        "    environment:",
+        f"      FLAG: {yaml_quote(config['flag'])}",
+        f"      ENABLE_POW: {yaml_quote('1' if config['enable_pow'] else '0')}",
+        f"      TIMEOUT: {yaml_quote(str(config['timeout']))}",
+        f"      LIBC_TOOL_LAUNCH_SCRIPT: {yaml_quote('/run_challenge.sh')}",
+        f"      LIBC_TOOL_GDBSERVER: {yaml_quote('1' if config['enable_gdbserver'] else '0')}",
+        f"      LIBC_TOOL_GDB_PORT: {yaml_quote(str(config['gdb_port']))}",
+        f"      LIBC_TOOL_GDB_PREPARE: {yaml_quote(config['gdb_prepare_script'])}",
+        f"      LIBC_TOOL_GDB_TARGET: {yaml_quote(config['gdb_target_path'])}",
+        f"      LIBC_TOOL_RUNTIME_OVERLAY: {yaml_quote(config['runtime_overlay_path'])}",
+        f"      LD_LIBRARY_PATH: {yaml_quote(config['library_path_env'])}",
+        "    ports:",
+        f"      - {yaml_quote(str(config['host_port']) + ':1337')}",
+        "    volumes:",
+        f"      - {yaml_quote(challenge_mount + ':' + config['challenge_root'])}",
+        f"      - {yaml_quote(runtime_mount + ':' + config['runtime_root'])}",
+    ])
+    if config['enable_gdbserver']:
+        lines.insert(lines.index("    volumes:"), f"      - {yaml_quote(str(config['gdb_port']) + ':' + str(config['gdb_port']))}")
+    lines.append("")
+    return "\n".join(lines)
+
+def ensure_runtime_dir_ready_for_execution(elf_path, runtime_dir, extra_needed=None):
+    result = inspect_runtime_dir_for_patch(runtime_dir, elf_path, extra_needed=extra_needed)
+    if not result['ok']:
+        raise RuntimeError(f"运行库目录不可直接执行: {format_runtime_probe_failure(result)}")
+    return result
+
+def prepare_runtime_dir_for_docker(args, parser, target_elf, extra_needed, extra_packages, package_hints):
+    if args.dir and args.libc:
+        parser.error('--dir 不能与 --libc 同时使用')
+    if args.dir and extra_packages:
+        parser.error('--dir 模式不支持 --extra-package，因为不会触发下载')
+
+    if args.dir:
+        runtime_dir = os.path.abspath(args.dir)
+        if not os.path.isdir(runtime_dir):
+            log.error(f"运行库目录不存在: {stderr_path(runtime_dir)}")
+            sys.exit(1)
+        ensure_runtime_dir_ready_for_execution(target_elf, runtime_dir, extra_needed=extra_needed)
+        return runtime_dir, None, None
+
+    ensure_pwntools_loaded()
+
+    if args.libc:
+        libc_candidate = None
+        libc_path = require_existing_file(args.libc, 'libc 文件')
+        local_runtime = inspect_local_runtime_dir_for_libc(
+            libc_path,
+            target_elf,
+            extra_needed=extra_needed,
+        )
+        if local_runtime['ok']:
+            return local_runtime['target_dir'], libc_path, libc_candidate
+    else:
+        libc_candidate = choose_libc_candidate_for_elf(target_elf, args)
+        if not libc_candidate:
+            sys.exit(1)
+        libc_path = libc_candidate.get('path')
+
+    output_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(
+        libc_path,
+        target_elf,
+    )
+    prepared_dir = download_and_setup_libc(
+        libc_path,
+        elf_path=target_elf,
+        target_dir=output_dir,
+        extra_needed=extra_needed,
+        package_hints=package_hints,
+        extra_packages=extra_packages,
+        libc_candidate=libc_candidate,
+    )
+    if not prepared_dir:
+        sys.exit(1)
+    ensure_runtime_dir_ready_for_execution(target_elf, prepared_dir, extra_needed=extra_needed)
+    return prepared_dir, libc_path, libc_candidate
+
+def write_generated_file(file_path, content, executable=False):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    if executable:
+        os.chmod(file_path, 0o755)
+
+def normalize_portable_relpath(path):
+    text = str(path or '').strip().replace('\\', '/')
+    return text.strip('/')
+
+def docker_bundle_root_host(deploy_dir):
+    return os.path.join(os.path.abspath(deploy_dir), DOCKER_BUNDLE_DIRNAME)
+
+def docker_bundle_challenge_host(deploy_dir):
+    return os.path.join(
+        docker_bundle_root_host(deploy_dir),
+        DOCKER_BUNDLE_CHALLENGE_DIRNAME,
+    )
+
+def docker_bundle_runtime_host(deploy_dir):
+    return os.path.join(
+        docker_bundle_root_host(deploy_dir),
+        DOCKER_BUNDLE_RUNTIME_DIRNAME,
+    )
+
+def reset_generated_path(target_path):
+    if os.path.isdir(target_path) and not os.path.islink(target_path):
+        shutil.rmtree(target_path)
+    elif os.path.lexists(target_path):
+        os.unlink(target_path)
+
+def copy_portable_tree(source_dir, target_dir, exclude_paths=None):
+    source_dir = os.path.abspath(source_dir)
+    target_dir = os.path.abspath(target_dir)
+    exclude_paths = {
+        os.path.abspath(path)
+        for path in (exclude_paths or ())
+        if path
+    }
+
+    def ignore(current_dir, names):
+        ignored = []
+        for name in names:
+            full_path = os.path.abspath(os.path.join(current_dir, name))
+            for excluded in exclude_paths:
+                if full_path == excluded or full_path.startswith(excluded + os.sep):
+                    ignored.append(name)
+                    break
+        return ignored
+
+    reset_generated_path(target_dir)
+    os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+    shutil.copytree(source_dir, target_dir, ignore=ignore)
+
+def generate_docker_bundle(
+    elf_path,
+    runtime_dir,
+    deploy_dir,
+    template_name,
+    challenge_dir,
+    host_port,
+    flag_value,
+    enable_pow,
+    timeout_seconds,
+    base_image,
+    container_name,
+    enable_gdbserver,
+    gdb_port,
+):
+    resolve_docker_template(template_name)
+    runtime_probe = ensure_runtime_dir_ready_for_execution(elf_path, runtime_dir)
+    challenge_dir = os.path.abspath(challenge_dir)
+    elf_path = os.path.abspath(elf_path)
+    runtime_dir = os.path.abspath(runtime_dir)
+    deploy_dir = os.path.abspath(deploy_dir)
+
+    try:
+        if os.path.commonpath([elf_path, challenge_dir]) != challenge_dir:
+            raise ValueError
+    except ValueError:
+        raise RuntimeError(f"目标 ELF 不在 challenge 目录内: {elf_path} !<= {challenge_dir}")
+
+    runtime_root = '/runtime'
+    challenge_root = '/challenge'
+    elf_container_path = relative_container_path(challenge_dir, elf_path, challenge_root)
+    exec_target_path = docker_exec_target_path(elf_container_path)
+    runtime_overlay_path = '/tmp/libc_tool_runtime_extra'
+    command = shell_join_args(['exec', exec_target_path])
+    elf_rel = os.path.relpath(elf_path, challenge_dir)
+    bundle_challenge_rel = normalize_portable_relpath(
+        os.path.join(DOCKER_BUNDLE_DIRNAME, DOCKER_BUNDLE_CHALLENGE_DIRNAME)
+    )
+    bundle_runtime_rel = normalize_portable_relpath(
+        os.path.join(DOCKER_BUNDLE_DIRNAME, DOCKER_BUNDLE_RUNTIME_DIRNAME)
+    )
+    bundle_elf_rel = normalize_portable_relpath(
+        os.path.join(DOCKER_BUNDLE_DIRNAME, DOCKER_BUNDLE_CHALLENGE_DIRNAME, elf_rel)
+    )
+    bundle_challenge_host = docker_bundle_challenge_host(deploy_dir)
+    bundle_runtime_host = docker_bundle_runtime_host(deploy_dir)
+    config = {
+        'container_name': container_name,
+        'flag': flag_value,
+        'enable_pow': enable_pow,
+        'timeout': timeout_seconds,
+        'challenge_root': challenge_root,
+        'runtime_root': runtime_root,
+        'command': command,
+        'host_port': host_port,
+        'challenge_dir_host': bundle_challenge_host,
+        'runtime_dir_host': bundle_runtime_host,
+        'deploy_dir_host': '',
+        'challenge_dir_rel': bundle_challenge_rel,
+        'runtime_dir_rel': bundle_runtime_rel,
+        'elf_path_host': '',
+        'elf_path_rel': bundle_elf_rel,
+        'enable_gdbserver': enable_gdbserver,
+        'gdb_port': gdb_port,
+        'gdb_prepare_script': '/prepare_gdb_target.sh' if enable_gdbserver else '',
+        'gdb_target_path': exec_target_path if enable_gdbserver else '',
+        'runtime_overlay_path': runtime_overlay_path,
+        'library_path_env': f'{runtime_overlay_path}:{challenge_root}',
+        'template_name': template_name,
+        'base_image': base_image,
+        'bundle_name': os.path.basename(os.path.normpath(deploy_dir)) or container_name,
+    }
+    os.makedirs(deploy_dir, exist_ok=True)
+    os.makedirs(os.path.join(deploy_dir, '.gdb_sysroot'), exist_ok=True)
+    copy_portable_tree(
+        challenge_dir,
+        bundle_challenge_host,
+        exclude_paths=[deploy_dir],
+    )
+    copy_portable_tree(runtime_dir, bundle_runtime_host)
+    write_generated_file(
+        os.path.join(deploy_dir, 'Dockerfile'),
+        render_dockerfile(base_image, template_name, enable_gdbserver=enable_gdbserver),
+    )
+    write_generated_file(
+        os.path.join(deploy_dir, 'docker-compose.yaml'),
+        render_docker_compose(config),
+    )
+    write_generated_file(
+        os.path.join(deploy_dir, 'run_pwn.sh'),
+        render_docker_run_script(),
+        executable=True,
+    )
+    write_generated_file(
+        os.path.join(deploy_dir, 'run_challenge.sh'),
+        render_docker_challenge_script(challenge_root, command),
+        executable=True,
+    )
+    write_generated_file(
+        os.path.join(deploy_dir, 'prepare_gdb_target.sh'),
+        render_docker_gdb_prepare_script(
+            runtime_root,
+            elf_container_path,
+            exec_target_path,
+        ),
+        executable=True,
+    )
+    gdb_script_path = os.path.join(deploy_dir, 'debug.gdb')
+    write_generated_file(
+        gdb_script_path,
+        render_docker_gdb_script(
+            bundle_elf_rel,
+            bundle_runtime_rel,
+            bundle_challenge_rel,
+            enable_gdbserver=enable_gdbserver,
+            gdb_port=gdb_port,
+            host_port=host_port,
+            remote_exec_file=exec_target_path,
+        ),
+    )
+    gdb_wrapper_path = os.path.join(deploy_dir, 'debug.sh')
+    write_generated_file(
+        gdb_wrapper_path,
+        render_docker_gdb_wrapper(),
+        executable=True,
+    )
+    flag_path = os.path.join(deploy_dir, 'flag')
+    if not os.path.exists(flag_path):
+        write_generated_file(flag_path, flag_value + '\n')
+    return {
+        'deploy_dir': deploy_dir,
+        'container_name': container_name,
+        'command': command,
+        'host_port': host_port,
+        'runtime_dir': bundle_runtime_host,
+        'challenge_dir': bundle_challenge_host,
+        'source_runtime_dir': runtime_dir,
+        'source_challenge_dir': challenge_dir,
+        'base_image': base_image,
+        'enable_gdbserver': enable_gdbserver,
+        'gdb_port': gdb_port,
+        'gdb_script_path': gdb_script_path,
+        'gdb_wrapper_path': gdb_wrapper_path,
+        'runtime_probe': runtime_probe,
+    }
+
+def run_docker_compose_action(deploy_dir, compose_args):
+    command = docker_compose_program() + list(compose_args)
+    result = subprocess.run(
+        command,
+        cwd=deploy_dir,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"docker compose {' '.join(compose_args)} 失败 (exit={result.returncode})"
+        )
+
+def resolve_docker_deploy_dir_for_elf(elf_path, deploy_dir=None):
+    if deploy_dir:
+        return os.path.abspath(deploy_dir)
+    if elf_path:
+        return default_docker_deploy_dir(elf_path)
+    return None
+
+def run_docker_command(args, parser):
+    validate_candidate_limit(args, parser)
+    extra_needed, extra_packages, package_hints = normalize_cli_dependency_options(args, parser)
+    quiet_yes = cli_auto_yes(args)
+    if args.down and args.destroy:
+        parser.error('--down 不能与 --destroy 同时使用')
+    if (args.down or args.destroy) and args.generate_only:
+        parser.error('--generate-only 不能与 --down/--destroy 同时使用')
+    if (args.down or args.destroy) and args.no_build:
+        parser.error('--no-build 不能与 --down/--destroy 同时使用')
+
+    target_elf = require_existing_elf(args.elf, '目标 ELF ') if args.elf else None
+    deploy_dir = resolve_docker_deploy_dir_for_elf(target_elf, args.deploy_dir)
+
+    if args.down:
+        if not deploy_dir:
+            parser.error('docker --down 需要目标 ELF 或 --deploy-dir')
+        if not os.path.isdir(deploy_dir):
+            log.error(f"Docker 部署目录不存在: {stderr_path(deploy_dir)}")
+            sys.exit(1)
+        try:
+            run_docker_compose_action(deploy_dir, ['down'])
+        except RuntimeError as e:
+            log.failure(str(e))
+            sys.exit(1)
+        log.success(f"Docker 环境已停止: {stderr_path(deploy_dir)}")
+        return
+
+    if args.destroy:
+        if deploy_dir:
+            if not os.path.isdir(deploy_dir):
+                log.error(f"Docker 部署目录不存在: {stderr_path(deploy_dir)}")
+                sys.exit(1)
+            target = {
+                'kind': 'deployment',
+                'display_name': os.path.basename(os.path.normpath(deploy_dir)) or deploy_dir,
+                'container_id': '',
+                'container_name': '',
+                'image_id': '',
+                'image_name': '',
+                'status': '',
+                'deploy_dir': deploy_dir,
+                'elf_path': target_elf or '',
+                'challenge_dir': '',
+                'runtime_dir': '',
+                'host_port': '',
+                'gdb_port': '',
+            }
+        else:
+            try:
+                targets = collect_libc_tool_docker_targets()
+            except RuntimeError as e:
+                log.failure(str(e))
+                sys.exit(1)
+            if not targets:
+                log.error("未找到由 libc_tool 构建的 Docker 容器或镜像。")
+                sys.exit(1)
+            target = choose_libc_tool_docker_target(
+                targets,
+                auto_yes=quiet_yes,
+            )
+        try:
+            result = destroy_libc_tool_docker_target(target)
+        except RuntimeError as e:
+            log.failure(str(e))
+            sys.exit(1)
+        if result.get('image_error'):
+            if target.get('kind') == 'image':
+                log.failure(f"Docker 镜像删除失败: {result['image_error']}")
+                sys.exit(1)
+            log.warning(f"容器已删除，但镜像删除失败: {result['image_error']}")
+        if target.get('kind') == 'image':
+            log.success(
+                f"Docker 镜像已销毁: "
+                f"{stderr_choice(normalize_docker_image_display_name(target.get('image_name') or target.get('image_id')))}"
+            )
+        elif result.get('mode') == 'compose':
+            log.success(f"Docker 环境和镜像已销毁: {stderr_path(result['deploy_dir'])}")
+        else:
+            log.success(
+                f"Docker 资源已销毁: "
+                f"{stderr_choice(target.get('container_name') or target.get('display_name'))}"
+            )
+        return
+
+    if not target_elf:
+        parser.error('docker 生成/启动模式需要目标 ELF')
+
+    with quiet_cli_progress(quiet_yes):
+        runtime_dir, _libc_path, libc_candidate = prepare_runtime_dir_for_docker(
+            args,
+            parser,
+            target_elf,
+            extra_needed,
+            extra_packages,
+            package_hints,
+        )
+    challenge_dir = os.path.abspath(args.challenge_dir) if args.challenge_dir else os.path.dirname(target_elf)
+    template_name = args.template
+    base_image = docker_base_image_for_runtime(
+        runtime_dir,
+        libc_candidate=libc_candidate,
+        override=args.base_image,
+    )
+    selected_host_port, selected_gdb_port = resolve_docker_host_ports(
+        args.port,
+        enable_gdbserver=args.gdbserver,
+        gdb_port=args.gdb_port,
+        auto_yes=quiet_yes,
+    )
+    container_name = args.container_name or (
+        f"libc-tool-{safe_name_fragment(os.path.basename(target_elf))}-{selected_host_port}"
+    )
+
+    try:
+        bundle = generate_docker_bundle(
+            target_elf,
+            runtime_dir,
+            deploy_dir,
+            template_name,
+            challenge_dir,
+            selected_host_port,
+            args.flag,
+            args.enable_pow,
+            args.timeout,
+            base_image,
+            container_name,
+            args.gdbserver,
+            selected_gdb_port,
+        )
+    except RuntimeError as e:
+        log.failure(str(e))
+        sys.exit(1)
+
+    if quiet_yes:
+        summary = (
+            f"Docker 部署目录已生成: {stderr_path(bundle['deploy_dir'])} "
+            f"(port={stderr_number(bundle['host_port'])}"
+        )
+        if bundle['enable_gdbserver']:
+            summary += f", gdb={stderr_number(bundle['gdb_port'])}"
+        summary += ")"
+        log.success(summary)
+    else:
+        log.success(
+            f"Docker 部署目录已生成: {stderr_path(bundle['deploy_dir'])} "
+            f"(base={stderr_choice(bundle['base_image'])}, port={stderr_number(bundle['host_port'])})"
+        )
+    log.info(f"题目目录挂载: {stderr_path(bundle['challenge_dir'])} -> /challenge")
+    log.info(f"运行库目录挂载: {stderr_path(bundle['runtime_dir'])} -> /runtime")
+    log.info(f"GDB 脚本已生成: {stderr_path(bundle['gdb_script_path'])}")
+    log.info(
+        f"使用: {stderr_path(bundle['gdb_wrapper_path'])}"
+    )
+    if bundle['enable_gdbserver']:
+        log.info(f"GDB 调试端口: {stderr_hint('127.0.0.1')}:{stderr_number(bundle['gdb_port'])}")
+
+    if args.generate_only:
+        return
+
+    compose_args = ['up', '-d']
+    if not args.no_build:
+        compose_args.append('--build')
+    try:
+        run_docker_compose_action(bundle['deploy_dir'], compose_args)
+    except RuntimeError as e:
+        log.failure(str(e))
+        sys.exit(1)
+
+    if quiet_yes:
+        summary = (
+            f"Docker 环境已启动: {stderr_hint('127.0.0.1')}:{stderr_number(bundle['host_port'])} "
+            f"(container={stderr_choice(bundle['container_name'])}"
+        )
+        if bundle['enable_gdbserver']:
+            summary += f", gdb={stderr_hint('127.0.0.1')}:{stderr_number(bundle['gdb_port'])}"
+        summary += ")"
+        log.success(summary)
+        if bundle['enable_gdbserver']:
+            log.success(
+                f"GDB remote 已就绪: {stderr_hint('target remote')} "
+                f"{stderr_hint('127.0.0.1')}:{stderr_number(bundle['gdb_port'])}"
+            )
+    else:
+        log.success(
+            f"Docker 环境已启动: {stderr_hint('127.0.0.1')}:{stderr_number(bundle['host_port'])} "
+            f"(container={stderr_choice(bundle['container_name'])})"
+        )
+        if bundle['enable_gdbserver']:
+            log.success(
+                f"GDB remote 已就绪: {stderr_hint('target remote')} "
+                f"{stderr_hint('127.0.0.1')}:{stderr_number(bundle['gdb_port'])}"
+            )
+
 def choose_libc_candidate_for_elf(elf_path, args):
+    quiet_yes = cli_auto_yes(args)
+    prefer_tui = (not quiet_yes) and prompt_toolkit_selector_available()
     matches = auto_find_libc(
         elf_path,
         candidate_limit=args.candidate_limit,
         group_variants=not args.all_variants,
+        quiet=prefer_tui or quiet_yes,
     )
     if not matches:
         sys.exit(1)
 
     selected_match = matches[0]
-    if getattr(args, 'yes', False):
-        if len(matches) > 1:
-            log.info(f"使用 --yes，自动选择推荐 libc: {stderr_name(selected_match['name'])}")
-        else:
-            log.info(f"使用 --yes，自动确认唯一匹配: {stderr_name(selected_match['name'])}")
-        return selected_match['path']
+    if quiet_yes:
+        return selected_match
+
+    tui_selected = try_prompt_toolkit_selector(
+        '选择 libc 候选',
+        (
+            '上下键选择候选 libc，Enter 确认，q 取消。'
+            if len(matches) > 1 else
+            '找到 1 个候选 libc，按 Enter 确认，或按 q 取消。'
+        ),
+        build_libc_selector_entries(matches),
+        detail_title='libc 详情',
+    )
+    if tui_selected is not _PROMPT_TOOLKIT_UNAVAILABLE:
+        if tui_selected is None:
+            return None
+        return tui_selected
+
+    if prefer_tui:
+        show_libc_candidates_for_selection(matches)
 
     try:
         if len(matches) > 1:
@@ -4213,7 +6315,8 @@ def choose_libc_candidate_for_elf(elf_path, args):
         log.info("已取消操作")
         return None
 
-    return selected_match['path']
+    log.info(f"已选择 libc: {stderr_name(selected_match['name'])}")
+    return selected_match
 
 def run_core_info_command(_args, _parser):
     core_path = find_rust_core_binary()
@@ -4258,6 +6361,7 @@ def run_download_command(args, parser):
     ensure_pwntools_loaded()
     validate_candidate_limit(args, parser)
     extra_needed, extra_packages, package_hints = normalize_cli_dependency_options(args, parser)
+    quiet_yes = cli_auto_yes(args)
 
     input_file = os.path.abspath(args.file)
     reference_elf = None
@@ -4270,32 +6374,43 @@ def run_download_command(args, parser):
 
     if is_elf_file(input_file) and not is_libc_family_name(input_file):
         reference_elf = input_file
-        log.info("检测到 ELF 文件，开始查找匹配的 libc...")
-        libc_path = choose_libc_candidate_for_elf(input_file, args)
-        if not libc_path:
+        if not quiet_yes:
+            log.info("检测到 ELF 文件，开始查找匹配的 libc...")
+        with quiet_cli_progress(quiet_yes):
+            libc_candidate = choose_libc_candidate_for_elf(input_file, args)
+        if not libc_candidate:
             return
+        libc_path = libc_candidate.get('path')
     else:
+        libc_candidate = None
         libc_path = input_file
         reference_elf = reference_elf or resolve_reference_elf_arg(libc_path, None)
-        log.info(f"直接从 {stderr_path(libc_path)} 下载 libc 调试信息...")
+        if not quiet_yes:
+            log.info(f"直接从 {stderr_path(libc_path)} 下载 libc 调试信息...")
 
     target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(input_file, reference_elf)
-    log.info("开始下载 libc 调试信息...")
-    prepared_dir = download_and_setup_libc(
-        libc_path,
-        elf_path=reference_elf,
-        target_dir=target_dir,
-        extra_needed=extra_needed,
-        package_hints=package_hints,
-        extra_packages=extra_packages,
-    )
+    if not quiet_yes:
+        log.info("开始下载 libc 调试信息...")
+    with quiet_cli_progress(quiet_yes):
+        prepared_dir = download_and_setup_libc(
+            libc_path,
+            elf_path=reference_elf,
+            target_dir=target_dir,
+            extra_needed=extra_needed,
+            package_hints=package_hints,
+            extra_packages=extra_packages,
+            libc_candidate=libc_candidate,
+        )
     if not prepared_dir:
         sys.exit(1)
+    if quiet_yes:
+        log.success(f"libc 已就绪: {stderr_path(prepared_dir)}")
 
 def run_patch_command(args, parser):
     validate_candidate_limit(args, parser)
     extra_needed, extra_packages, package_hints = normalize_cli_dependency_options(args, parser)
     target_elf = require_existing_elf(args.elf, '目标 ELF ')
+    quiet_yes = cli_auto_yes(args)
 
     if args.dir and args.libc:
         parser.error('--dir 不能与 --libc 同时使用')
@@ -4308,79 +6423,92 @@ def run_patch_command(args, parser):
             log.error(f"运行库目录不存在: {stderr_path(patch_dir)}")
             sys.exit(1)
         try:
-            plan = patch_elf_with_runtime_dir(
-                target_elf,
-                patch_dir,
-                mode=args.patch_mode,
-                verify=not args.no_verify,
-                extra_needed=extra_needed,
-            )
+            with quiet_cli_progress(quiet_yes):
+                plan = patch_elf_with_runtime_dir(
+                    target_elf,
+                    patch_dir,
+                    mode=args.patch_mode,
+                    verify=not args.no_verify,
+                    extra_needed=extra_needed,
+                )
         except RuntimeError as e:
             log.failure(str(e))
             sys.exit(1)
-        log_patch_completion(target_elf, plan)
+        log_patch_completion(target_elf, plan, verbose=not quiet_yes)
         return
 
     ensure_pwntools_loaded()
 
     if args.libc:
+        libc_candidate = None
         libc_path = require_existing_file(args.libc, 'libc 文件')
-        log.info(f"使用提供的 libc 文件: {stderr_path(libc_path)}")
+        if not quiet_yes:
+            log.info(f"使用提供的 libc 文件: {stderr_path(libc_path)}")
         local_runtime = inspect_local_runtime_dir_for_libc(
             libc_path,
             target_elf,
             extra_needed=extra_needed,
         )
         if local_runtime['ok']:
-            log.info(f"检测到本地完整运行库，直接 patch: {stderr_path(local_runtime['target_dir'])}")
+            if not quiet_yes:
+                log.info(f"检测到本地完整运行库，直接 patch: {stderr_path(local_runtime['target_dir'])}")
             try:
-                plan = patch_elf_with_runtime_dir(
-                    target_elf,
-                    local_runtime['target_dir'],
-                    mode=args.patch_mode,
-                    verify=not args.no_verify,
-                    extra_needed=extra_needed,
-                )
+                with quiet_cli_progress(quiet_yes):
+                    plan = patch_elf_with_runtime_dir(
+                        target_elf,
+                        local_runtime['target_dir'],
+                        mode=args.patch_mode,
+                        verify=not args.no_verify,
+                        extra_needed=extra_needed,
+                    )
             except RuntimeError as e:
                 log.failure(str(e))
                 sys.exit(1)
-            log_patch_completion(target_elf, plan)
+            log_patch_completion(target_elf, plan, verbose=not quiet_yes)
             return
-        log.info(
-            "本地运行库不可直接 patch，回退到下载流程: "
-            + format_runtime_probe_failure(local_runtime)
-        )
+        if not quiet_yes:
+            log.info(
+                "本地运行库不可直接 patch，回退到下载流程: "
+                + format_runtime_probe_failure(local_runtime)
+            )
     else:
-        log.info("检测到 ELF 文件，开始查找匹配的 libc...")
-        libc_path = choose_libc_candidate_for_elf(target_elf, args)
-        if not libc_path:
+        if not quiet_yes:
+            log.info("检测到 ELF 文件，开始查找匹配的 libc...")
+        with quiet_cli_progress(quiet_yes):
+            libc_candidate = choose_libc_candidate_for_elf(target_elf, args)
+        if not libc_candidate:
             return
+        libc_path = libc_candidate.get('path')
 
     target_dir = os.path.abspath(args.output_dir) if args.output_dir else get_download_target_dir(libc_path, target_elf)
-    log.info("开始下载 libc 调试信息...")
-    prepared_dir = download_and_setup_libc(
-        libc_path,
-        elf_path=target_elf,
-        target_dir=target_dir,
-        extra_needed=extra_needed,
-        package_hints=package_hints,
-        extra_packages=extra_packages,
-    )
+    if not quiet_yes:
+        log.info("开始下载 libc 调试信息...")
+    with quiet_cli_progress(quiet_yes):
+        prepared_dir = download_and_setup_libc(
+            libc_path,
+            elf_path=target_elf,
+            target_dir=target_dir,
+            extra_needed=extra_needed,
+            package_hints=package_hints,
+            extra_packages=extra_packages,
+            libc_candidate=libc_candidate,
+        )
     if not prepared_dir:
         sys.exit(1)
 
     try:
-        plan = patch_elf_with_runtime_dir(
-            target_elf,
-            prepared_dir,
-            mode=args.patch_mode,
-            verify=not args.no_verify,
-            extra_needed=extra_needed,
-        )
+        with quiet_cli_progress(quiet_yes):
+            plan = patch_elf_with_runtime_dir(
+                target_elf,
+                prepared_dir,
+                mode=args.patch_mode,
+                verify=not args.no_verify,
+                extra_needed=extra_needed,
+            )
     except RuntimeError as e:
         log.failure(str(e))
         sys.exit(1)
-    log_patch_completion(target_elf, plan)
+    log_patch_completion(target_elf, plan, verbose=not quiet_yes)
 
 def run_restore_command(args, _parser):
     target_elf = require_existing_elf(args.elf, '目标 ELF ')
@@ -4399,7 +6527,7 @@ def add_dependency_args(parser):
 def add_candidate_args(parser):
     parser.add_argument('--all-variants', action='store_true', help='显示并可选择所有 libc 子版本，不按家族合并')
     parser.add_argument('--candidate-limit', type=int, default=20, help='候选 libc 显示/可选上限，默认 20，传 0 表示不限制')
-    parser.add_argument('--yes', '-y', action='store_true', help='自动选择推荐候选并确认后续提示')
+    parser.add_argument('--yes', '-y', action='store_true', help='自动选择推荐候选并确认后续提示，同时精简终端输出')
 
 def add_patch_behavior_args(parser):
     parser.add_argument('--patch-mode', choices=('rpath', 'replace-needed'), default='rpath', help='patch 模式，默认 rpath')
@@ -4410,6 +6538,7 @@ def supported_cli_commands():
         'find',
         'download',
         'patch',
+        'docker',
         'restore',
         'doctor',
         'rebuild-index',
@@ -4424,6 +6553,7 @@ def supported_cli_command_aliases():
         'dlo': 'download',
         'pt': 'patch',
         'p': 'patch',
+        'dk': 'docker',
         'rs': 'restore',
         'r': 'restore',
         'dr': 'doctor',
@@ -4494,6 +6624,30 @@ def build_cli_parser():
     add_candidate_args(patch_parser)
     add_patch_behavior_args(patch_parser)
     patch_parser.set_defaults(command_func=run_patch_command)
+
+    docker_parser = subparsers.add_parser('docker', help='为目标 ELF 生成/启动 Docker 调试环境，或管理 libc_tool 创建的 Docker 资源')
+    docker_parser.add_argument('elf', nargs='?', help='目标 ELF 路径；在 --down/--destroy 模式下可省略')
+    docker_parser.add_argument('--libc', default=None, help='显式指定 libc.so.6 文件；若同目录已有完整运行库则直接使用，否则回退到下载')
+    docker_parser.add_argument('--dir', default=None, help='直接使用已有运行库目录生成 Docker 环境，不触发下载')
+    docker_parser.add_argument('--output-dir', default=None, help='指定自动下载运行库输出目录，默认使用目标 ELF 同目录下的 libc_dir')
+    docker_parser.add_argument('--challenge-dir', default=None, help='挂载到容器内 /challenge 的宿主机目录，默认使用目标 ELF 所在目录')
+    docker_parser.add_argument('--deploy-dir', default=None, help='生成 Docker 部署文件的目录，默认使用目标 ELF 同目录下的隐藏目录')
+    docker_parser.add_argument('--template', default='ubuntu+socat', help='参考的 deploy 模板名称，默认 ubuntu+socat')
+    docker_parser.add_argument('--base-image', default=None, help='显式指定容器基础镜像，例如 ubuntu:22.04')
+    docker_parser.add_argument('--container-name', default=None, help='显式指定容器名，默认自动生成')
+    docker_parser.add_argument('--port', type=int, default=10001, help='宿主机映射端口，默认 10001')
+    docker_parser.add_argument('--gdbserver', action='store_true', help='额外启用 gdbserver 远程调试端口')
+    docker_parser.add_argument('--gdb-port', type=int, default=1234, help='宿主机映射的 gdbserver 端口，默认 1234')
+    docker_parser.add_argument('--flag', default='flag{this_is_a_real_flag}', help='容器内默认 flag 内容')
+    docker_parser.add_argument('--enable-pow', action='store_true', help='启用模板中的 sha256 proof-of-work')
+    docker_parser.add_argument('--timeout', type=int, default=300, help='题目进程最大运行秒数，默认 300')
+    docker_parser.add_argument('--generate-only', action='store_true', help='只生成 Docker 部署目录，不启动容器')
+    docker_parser.add_argument('--no-build', action='store_true', help='启动时不附带 --build')
+    docker_parser.add_argument('--down', action='store_true', help='停止并移除该 ELF 对应的 Docker 环境')
+    docker_parser.add_argument('--destroy', action='store_true', help='销毁 Docker 环境并删除镜像；未提供 ELF/--deploy-dir 时会列出 libc_tool 创建的容器/镜像供选择')
+    add_dependency_args(docker_parser)
+    add_candidate_args(docker_parser)
+    docker_parser.set_defaults(command_func=run_docker_command)
 
     restore_parser = subparsers.add_parser('restore', help='从 .bak 恢复被 patch 的 ELF')
     restore_parser.add_argument('elf', help='目标 ELF 路径')

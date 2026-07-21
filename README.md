@@ -16,6 +16,7 @@
 - `zstandard`
 - `eu-unstrip`（来自 `elfutils`，用于把 `libc6-dbg` / `libc6-dbgsym` 合并成未 strip 的 libc）
 - `readelf`、`objdump`、`strings`
+- 可选：`docker compose` 或 `docker-compose`，用于一键启动容器调试环境
 - 可选：Rust/Cargo，用于构建 `libc_tool_core`
 检查：
 
@@ -154,11 +155,130 @@ python3 libc_tool.py cor
 python3 libc_tool.py download -y ./pwn
 ```
 
+在交互终端里，如果不加 `-y`，`libc_tool` 会自动启用基于 Python `prompt_toolkit` 的 TUI 选择器：
+
+- 选择候选 `libc`
+- 选择 `docker --destroy` 要销毁的容器/镜像
+
+如果你更喜欢旧的编号输入模式，可以临时关闭：
+
+```bash
+LIBC_TOOL_DISABLE_TUI=1 python3 libc_tool.py patch ./pwn
+```
+
 如果你只有一个 ELF，并且希望自动完成“匹配 libc -> 下载运行库 -> patch ELF”，可以直接：
 
 ```bash
 python3 libc_tool.py patch -y ./pwn
 ```
+
+如果你希望直接为目标 ELF 起一个容器调试环境，并把题目目录和运行库目录映射到容器里，可以直接：
+
+```bash
+python3 libc_tool.py docker -y ./pwn
+```
+
+默认行为：
+
+- 自动匹配并准备运行库
+- 根据匹配到的 `libc/ld` 推断尽量匹配的 Ubuntu 基础镜像版本
+- 在目标 ELF 同目录下生成一套基于 `./deploy_pwn_template/ubuntu+socat` 风格的部署目录；若仓库内未携带模板，则回退到 `/home/starlight/CTF/deploy_pwn_template/ubuntu+socat`
+- 生成的部署目录会自带 `bundle/challenge` 和 `bundle/runtime`，`docker-compose.yaml` 使用相对路径挂载；整个目录可直接复制到别的 Linux 上继续 `docker compose up -d --build`
+- 默认把宿主机 `10001` 端口映射到容器内 `1337`
+- 把部署目录里的 `./bundle/challenge` 挂载到容器内 `/challenge`
+- 把部署目录里的 `./bundle/runtime` 挂载到容器内 `/runtime`
+- 容器内直接执行目标 ELF，不再显式调用自定义 `ld-linux ... --library-path ...`
+- `/runtime` 主要作为额外共享库来源，容器会把非 glibc 核心库整理到单独目录并通过 `LD_LIBRARY_PATH` 提供给题目
+
+只生成部署文件、不立即启动容器：
+
+```bash
+python3 libc_tool.py docker -y --generate-only ./pwn
+```
+
+直接使用本地现成运行库目录：
+
+```bash
+python3 libc_tool.py docker --dir ./libc_dir ./pwn
+```
+
+如果你需要容器内额外开启 `gdbserver` 远程调试端口：
+
+```bash
+python3 libc_tool.py docker -y --gdbserver --gdb-port 1234 ./pwn
+```
+
+此时：
+
+- 服务端口仍然走 `--port`，默认 `10001`
+- `gdbserver` 会额外映射一个宿主机端口，默认 `1234`
+- 部署目录里会自动生成 `debug.gdb` 和便携启动脚本 `debug.sh`
+- 宿主机可直接：
+
+```bash
+./.libc_tool_docker_pwn/debug.sh
+```
+
+如果当前部署开启了 `--gdbserver`，`debug.gdb` 里会自动带上：
+
+- 相对部署目录自动推导出的 ELF 路径
+- 运行库搜索路径和 `/challenge`、`/runtime` 的路径映射
+- `target remote 127.0.0.1:<gdb-port>`
+
+注意：容器里的题目进程仍然是由服务端口触发的，所以通常要先让 `exp` 或 `nc 127.0.0.1 <port>` 连上服务端口，再执行 `./debug.sh`。
+
+如果默认宿主机端口已经被别的题目容器占用：
+
+- 交互终端下会自动弹出 TUI，让你选择新的服务端口或 `gdbserver` 端口
+- `-y` 模式下会自动挑选附近的空闲端口继续启动
+- 也仍然可以手动显式传 `--port` / `--gdb-port`
+
+停止该 ELF 对应的容器环境：
+
+```bash
+python3 libc_tool.py docker --down ./pwn
+```
+
+如果你还希望把该 ELF 对应的 Docker 镜像也一起删除，可以使用：
+
+```bash
+python3 libc_tool.py docker ./pwn --destroy
+```
+
+这会等价执行该部署目录下的：
+
+```bash
+docker compose down --rmi all --remove-orphans
+```
+
+如果没有记住对应的 ELF 或部署目录，也可以直接：
+
+```bash
+python3 libc_tool.py docker --destroy
+```
+
+命令会列出由 `libc_tool` 创建的容器和未使用镜像，交互选择后再销毁。
+
+仓库里也提供了一个可直接运行的本地 smoke 测试目录：
+
+```bash
+make -C tests/docker_smoke smoke
+```
+
+或：
+
+```bash
+bash tests/docker_smoke/run_smoke.sh
+```
+
+这个测试会：
+
+- 现场编译一个最小 ELF
+- 自动从宿主机提取当前 ELF 使用的 `libc.so.6` 和 `ld-linux-x86-64.so.2`
+- 分别验证普通 `docker --generate-only` 和 `--gdbserver` 生成结果
+- 默认把中间产物放到 `/tmp`，不污染仓库；如需保留，执行时加 `KEEP=1`
+
+自动匹配到候选 libc 后，后续下载/patch 会优先使用索引缓存里保存的包元数据，不要求 `LIBC_DB_PATH` 下对应的原始 `.so` 仍然存在；也就是说，匹配阶段和自动下载阶段都可以主要依赖索引表完成。
 
 直接下载某个 `libc` 的运行库：
 
