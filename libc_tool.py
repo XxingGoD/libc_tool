@@ -5245,7 +5245,14 @@ def selector_window_bounds(total_count, selected_index, window_size):
         start = end - window_size
     return start, end
 
-def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情', context_lines=None):
+def try_prompt_toolkit_selector(
+    title,
+    subtitle,
+    entries,
+    detail_title='详情',
+    context_lines=None,
+    multi=False,
+):
     if not entries:
         return None
     if not prompt_toolkit_selector_available():
@@ -5264,6 +5271,8 @@ def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情',
     state = {
         'selected_index': 0,
         'result_index': None,
+        'result_indices': None,
+        'selected_indices': {0} if multi else set(),
     }
     max_visible_items = 10
 
@@ -5287,18 +5296,34 @@ def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情',
         for index in range(start, end):
             item = entries[index]
             selected = index == selected_index
-            prefix = "❯" if selected else " "
             label = truncate_ui_text(item.get('label', ''), max_length=110)
-            if selected:
-                line = tui_style(f"{prefix} {label}", fg=255, bold=True, italic=True, reverse=True)
+            prefix = "❯" if selected else " "
+            if multi:
+                marker = "[x]" if index in state['selected_indices'] else "[ ]"
+                line_text = f"{prefix} {marker} {label}"
+                if selected:
+                    line = tui_style(line_text, fg=255, bold=True, italic=True, reverse=True)
+                else:
+                    line = tui_style(line_text, fg=251, italic=True)
             else:
-                line = f"{prefix} {tui_style(label, fg=251, italic=True)}"
+                if selected:
+                    line = tui_style(f"{prefix} {label}", fg=255, bold=True, italic=True, reverse=True)
+                else:
+                    line = f"{prefix} {tui_style(label, fg=251, italic=True)}"
             lines.append(line)
         if end < len(entries):
             lines.append(tui_style("  ...", dim=True))
+        if multi:
+            footer = (
+                f"{selected_index + 1}/{len(entries)} | "
+                f"已选 {len(state['selected_indices'])} 项 | "
+                "Space 勾选/取消 | Enter 确认 | q 取消"
+            )
+        else:
+            footer = f"{selected_index + 1}/{len(entries)} | Enter 确认 | q 取消"
         lines.extend([
             "",
-            tui_style(f"{selected_index + 1}/{len(entries)} | Enter 确认 | q 取消", dim=True),
+            tui_style(footer, dim=True),
             "",
             tui_style(detail_title, fg=120, bold=True),
         ])
@@ -5344,9 +5369,22 @@ def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情',
         state['selected_index'] = len(entries) - 1
         event.app.invalidate()
 
+    if multi:
+        @kb.add('space')
+        def _toggle_selection(event):
+            selected_index = state['selected_index']
+            if selected_index in state['selected_indices']:
+                state['selected_indices'].remove(selected_index)
+            else:
+                state['selected_indices'].add(selected_index)
+            event.app.invalidate()
+
     @kb.add('enter')
     def _accept(event):
-        state['result_index'] = state['selected_index']
+        if multi:
+            state['result_indices'] = sorted(state['selected_indices'])
+        else:
+            state['result_index'] = state['selected_index']
         event.app.exit()
 
     @kb.add('q')
@@ -5367,6 +5405,10 @@ def try_prompt_toolkit_selector(title, subtitle, entries, detail_title='详情',
         log.debug(f"prompt_toolkit 选择器执行失败，回退到文本选择: {e}")
         return _PROMPT_TOOLKIT_UNAVAILABLE
 
+    if multi:
+        if state['result_indices'] is None:
+            return None
+        return [entries[index].get('value') for index in state['result_indices']]
     if state['result_index'] is None:
         return None
     return entries[state['result_index']].get('value')
@@ -6141,48 +6183,77 @@ def show_libc_tool_docker_targets(targets):
         if target.get('deploy_dir'):
             sys.stdout.write(f"    deploy: {target['deploy_dir']}\n")
 
-def choose_libc_tool_docker_target(targets, auto_yes=False):
+def parse_docker_target_selection(choice, target_count):
+    choice = str(choice or '').strip().lower()
+    if choice in {'all', 'a', '*'}:
+        return list(range(target_count))
+    if not choice:
+        return [0]
+
+    selected = set()
+    for token in re.split(r'[,\s]+', choice):
+        if not token:
+            continue
+        if '-' in token:
+            bounds = token.split('-', 1)
+            if len(bounds) != 2 or not all(bound.isdigit() for bound in bounds):
+                raise ValueError(f"无效选择: {token}")
+            start, end = (int(bound) for bound in bounds)
+            if start > end:
+                start, end = end, start
+            indices = range(start, end + 1)
+        elif token.isdigit():
+            indices = (int(token),)
+        else:
+            raise ValueError(f"无效选择: {token}")
+        for index in indices:
+            if index < 0 or index >= target_count:
+                raise ValueError(f"编号超出范围: {index}")
+            selected.add(index)
+    return sorted(selected)
+
+def choose_libc_tool_docker_targets(targets, auto_yes=False):
     if not targets:
-        return None
+        return []
     if auto_yes:
-        if len(targets) == 1:
-            return targets[0]
-        log.error("--yes 只能在唯一一个 Docker 资源时自动选择；请显式传入 ELF/--deploy-dir，或手动选择。")
-        sys.exit(1)
+        log.warning(f"--yes 将批量销毁全部 {len(targets)} 个 Docker 资源。")
+        return list(targets)
     tui_selected = try_prompt_toolkit_selector(
-        '选择 Docker 资源',
-        '上下键选择要销毁的容器或镜像，Enter 确认，q 取消。',
+        '批量选择 Docker 资源',
+        '上下键移动，Space 勾选/取消，Enter 确认，q 取消。',
         build_docker_selector_entries(targets),
         detail_title='Docker 详情',
+        multi=True,
     )
     if tui_selected is not _PROMPT_TOOLKIT_UNAVAILABLE:
-        if tui_selected is None:
+        if not tui_selected:
             sys.exit(0)
+        log.info(f"已选择 {len(tui_selected)} 个 Docker 资源。")
         return tui_selected
     show_libc_tool_docker_targets(targets)
     while True:
         try:
             choice = prompt_input(
-                f"\n请选择要销毁的 Docker 资源 (0-{len(targets)-1})，默认 0，输入 q 取消。"
+                f"\n请选择要销毁的 Docker 资源 (可输入 0,2 或 1-3，输入 all 全选)，默认 0，输入 q 取消。"
             ).strip()
         except EOFError:
             log.error("输入结束，已取消销毁。")
             sys.exit(1)
-        if not choice:
-            return targets[0]
         if choice.lower() in {'q', 'quit', 'exit'}:
             log.info("已取消销毁。")
             sys.exit(0)
         try:
-            index = int(choice)
+            indices = parse_docker_target_selection(choice, len(targets))
         except ValueError:
-            log.warning("请输入有效编号。")
+            log.warning("请输入有效编号、范围或 all。")
             continue
-        if 0 <= index < len(targets):
-            selected_target = targets[index]
-            log.info(f"已选择 Docker 资源: {stderr_choice(selected_target.get('display_name', '<unknown>'))}")
-            return selected_target
-        log.warning(f"编号超出范围，请输入 0 到 {len(targets)-1}。")
+        selected_targets = [targets[index] for index in indices]
+        log.info(f"已选择 {len(selected_targets)} 个 Docker 资源。")
+        return selected_targets
+
+def choose_libc_tool_docker_target(targets, auto_yes=False):
+    selected_targets = choose_libc_tool_docker_targets(targets, auto_yes=auto_yes)
+    return selected_targets[0] if selected_targets else None
 
 def destroy_libc_tool_docker_target(target):
     deploy_dir = target.get('deploy_dir')
@@ -6203,13 +6274,25 @@ def destroy_libc_tool_docker_target(target):
             removal = remove_image_refs(image_target.get('image_items') or ())
             removed_ids.extend(removal.get('removed_ids', ()))
             removal_errors.extend(removal.get('errors', ()))
+        deploy_dir_removed = False
+        deploy_dir_error = ''
+        if deploy_dir and os.path.lexists(deploy_dir):
+            try:
+                deploy_dir_removed = remove_docker_deploy_dir(
+                    deploy_dir,
+                    allow_custom=True,
+                )
+            except RuntimeError as e:
+                deploy_dir_error = str(e)
         return {
             'mode': 'compose',
             'deploy_dir': deploy_dir,
             'container_removed': True,
             'image_removed': not removal_errors,
             'image_error': "\n".join(removal_errors),
+            'deploy_dir_error': deploy_dir_error,
             'removed_ids': removed_ids,
+            'deploy_dir_removed': deploy_dir_removed,
         }
 
     if target.get('kind') == 'deployment' and target.get('container_id'):
@@ -6236,13 +6319,25 @@ def destroy_libc_tool_docker_target(target):
             image_removed = True
             image_error = ''
             removed_ids = ()
+    deploy_dir_removed = False
+    deploy_dir_error = ''
+    if deploy_dir and os.path.lexists(deploy_dir):
+        try:
+            deploy_dir_removed = remove_docker_deploy_dir(
+                deploy_dir,
+                allow_custom=True,
+            )
+        except RuntimeError as e:
+            deploy_dir_error = str(e)
     return {
         'mode': 'direct',
         'deploy_dir': deploy_dir,
         'container_removed': target.get('kind') == 'image' or bool(target.get('container_id')),
         'image_removed': image_removed,
         'image_error': image_error,
+        'deploy_dir_error': deploy_dir_error,
         'removed_ids': removed_ids,
+        'deploy_dir_removed': deploy_dir_removed,
     }
 
 def yaml_quote(value):
@@ -7101,6 +7196,23 @@ def run_docker_compose_action(deploy_dir, compose_args):
             f"docker compose {' '.join(compose_args)} 失败 (exit={result.returncode})"
         )
 
+def remove_docker_deploy_dir(deploy_dir, allow_custom=False):
+    if not deploy_dir:
+        return False
+    deploy_dir = os.path.abspath(os.path.normpath(deploy_dir))
+    base_name = os.path.basename(deploy_dir)
+    if not base_name or deploy_dir == os.path.abspath(os.sep):
+        raise RuntimeError(f"拒绝删除不安全的 Docker 部署路径: {deploy_dir}")
+    if not allow_custom and not base_name.startswith('.libc_tool_docker_'):
+        raise RuntimeError(f"不是默认 libc_tool Docker 部署目录，拒绝删除: {deploy_dir}")
+    if not os.path.lexists(deploy_dir):
+        return False
+    try:
+        reset_generated_path(deploy_dir)
+    except OSError as e:
+        raise RuntimeError(f"删除 Docker 部署目录失败: {deploy_dir}: {e}") from e
+    return True
+
 def resolve_docker_deploy_dir_for_elf(elf_path, deploy_dir=None):
     if deploy_dir:
         return os.path.abspath(deploy_dir)
@@ -7130,10 +7242,17 @@ def run_docker_command(args, parser):
             sys.exit(1)
         try:
             run_docker_compose_action(deploy_dir, ['down'])
+            deploy_dir_removed = remove_docker_deploy_dir(
+                deploy_dir,
+                allow_custom=bool(args.deploy_dir),
+            )
         except RuntimeError as e:
             log.failure(str(e))
             sys.exit(1)
-        log.success(f"Docker 环境已停止: {stderr_path(deploy_dir)}")
+        if deploy_dir_removed:
+            log.success(f"Docker 环境已停止并删除部署目录: {stderr_path(deploy_dir)}")
+        else:
+            log.success(f"Docker 环境已停止: {stderr_path(deploy_dir)}")
         return
 
     if args.destroy:
@@ -7141,7 +7260,7 @@ def run_docker_command(args, parser):
             if not os.path.isdir(deploy_dir):
                 log.error(f"Docker 部署目录不存在: {stderr_path(deploy_dir)}")
                 sys.exit(1)
-            target = {
+            targets = [{
                 'kind': 'deployment',
                 'display_name': os.path.basename(os.path.normpath(deploy_dir)) or deploy_dir,
                 'container_id': '',
@@ -7155,7 +7274,7 @@ def run_docker_command(args, parser):
                 'runtime_dir': '',
                 'host_port': '',
                 'gdb_port': '',
-            }
+            }]
         else:
             try:
                 targets = collect_libc_tool_docker_targets()
@@ -7165,32 +7284,46 @@ def run_docker_command(args, parser):
             if not targets:
                 log.error("未找到由 libc_tool 构建的 Docker 容器或镜像。")
                 sys.exit(1)
-            target = choose_libc_tool_docker_target(
+            targets = choose_libc_tool_docker_targets(
                 targets,
                 auto_yes=quiet_yes,
             )
-        try:
-            result = destroy_libc_tool_docker_target(target)
-        except RuntimeError as e:
-            log.failure(str(e))
-            sys.exit(1)
-        if result.get('image_error'):
+        failures = []
+        for target in targets:
+            target_name = target.get('display_name') or target.get('container_name') or '<unknown>'
+            try:
+                result = destroy_libc_tool_docker_target(target)
+            except RuntimeError as e:
+                failures.append(f"{target_name}: {e}")
+                log.failure(f"销毁 {target_name} 失败: {e}")
+                continue
+            if result.get('image_error'):
+                if target.get('kind') == 'image':
+                    failures.append(f"{target_name}: {result['image_error']}")
+                    log.failure(f"Docker 镜像删除失败: {result['image_error']}")
+                else:
+                    log.warning(f"容器已删除，但镜像删除失败: {result['image_error']}")
+            if result.get('deploy_dir_error'):
+                failures.append(f"{target_name}: {result['deploy_dir_error']}")
+                log.failure(result['deploy_dir_error'])
             if target.get('kind') == 'image':
-                log.failure(f"Docker 镜像删除失败: {result['image_error']}")
-                sys.exit(1)
-            log.warning(f"容器已删除，但镜像删除失败: {result['image_error']}")
-        if target.get('kind') == 'image':
-            log.success(
-                f"Docker 镜像已销毁: "
-                f"{stderr_choice(normalize_docker_image_display_name(target.get('image_name') or target.get('image_id')))}"
-            )
-        elif result.get('mode') == 'compose':
-            log.success(f"Docker 环境和镜像已销毁: {stderr_path(result['deploy_dir'])}")
-        else:
-            log.success(
-                f"Docker 资源已销毁: "
-                f"{stderr_choice(target.get('container_name') or target.get('display_name'))}"
-            )
+                resource_label = (
+                    f"Docker 镜像已销毁: "
+                    f"{stderr_choice(normalize_docker_image_display_name(target.get('image_name') or target.get('image_id')))}"
+                )
+            elif result.get('mode') == 'compose':
+                resource_label = f"Docker 环境和镜像已销毁: {stderr_path(result['deploy_dir'])}"
+            else:
+                resource_label = (
+                    f"Docker 资源已销毁: "
+                    f"{stderr_choice(target.get('container_name') or target.get('display_name'))}"
+                )
+            if result.get('deploy_dir_removed'):
+                resource_label += "（部署目录已删除）"
+            log.success(resource_label)
+        if failures:
+            log.failure(f"批量销毁完成，但有 {len(failures)} 个资源失败。")
+            sys.exit(1)
         return
 
     if not target_elf:
@@ -7711,8 +7844,8 @@ def build_cli_parser():
     docker_parser.add_argument('--timeout', type=int, default=300, help='题目进程最大运行秒数，默认 300')
     docker_parser.add_argument('--generate-only', action='store_true', help='只生成 Docker 部署目录，不启动容器')
     docker_parser.add_argument('--no-build', action='store_true', help='启动时不附带 --build')
-    docker_parser.add_argument('--down', action='store_true', help='停止并移除该 ELF 对应的 Docker 环境')
-    docker_parser.add_argument('--destroy', action='store_true', help='销毁 Docker 环境并删除镜像；未提供 ELF/--deploy-dir 时会列出 libc_tool 创建的容器/镜像供选择')
+    docker_parser.add_argument('--down', action='store_true', help='停止并移除该 ELF 对应的 Docker 环境，同时删除生成的部署目录')
+    docker_parser.add_argument('--destroy', action='store_true', help='销毁 Docker 环境并删除镜像和部署目录；未提供 ELF/--deploy-dir 时支持交互批量选择')
     add_dependency_args(docker_parser)
     add_candidate_args(docker_parser)
     docker_parser.set_defaults(command_func=run_docker_command)

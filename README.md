@@ -246,7 +246,7 @@ python3 libc_tool.py docker -y --gdbserver --gdb-port 1234 ./pwn
 - `-y` 模式下会自动挑选附近的空闲端口继续启动
 - 也仍然可以手动显式传 `--port` / `--gdb-port`
 
-停止该 ELF 对应的容器环境：
+停止并清理该 ELF 对应的容器环境和生成目录：
 
 ```bash
 python3 libc_tool.py docker --down ./pwn
@@ -263,6 +263,8 @@ python3 libc_tool.py docker ./pwn --destroy
 ```bash
 docker compose down --rmi all --remove-orphans
 ```
+
+`docker --destroy` 未指定 ELF 时会进入批量选择：TUI 中使用 Space 勾选/取消、Enter 确认；无 TUI 时可输入 `0,2`、`1-3` 或 `all`。使用 `-y` 会直接销毁发现的全部 libc_tool Docker 资源。
 
 如果没有记住对应的 ELF 或部署目录，也可以直接：
 

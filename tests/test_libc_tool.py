@@ -171,6 +171,78 @@ class LibcToolTest(unittest.TestCase):
         self.assertIn("gdb.execute('sharedlibrary', to_string=True)", gdb_script)
         self.assertIn('target remote 127.0.0.1:1234', gdb_script)
 
+    def test_docker_destroy_selection_supports_lists_ranges_and_all(self):
+        self.assertEqual(
+            libc_tool.parse_docker_target_selection('0, 2, 4', 5),
+            [0, 2, 4],
+        )
+        self.assertEqual(
+            libc_tool.parse_docker_target_selection('3-1', 5),
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            libc_tool.parse_docker_target_selection('all', 3),
+            [0, 1, 2],
+        )
+        with self.assertRaises(ValueError):
+            libc_tool.parse_docker_target_selection('0,9', 3)
+
+    def test_docker_deploy_dir_cleanup_is_guarded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generated_dir = os.path.join(temp_dir, '.libc_tool_docker_pwn')
+            os.makedirs(generated_dir)
+            self.assertTrue(libc_tool.remove_docker_deploy_dir(generated_dir))
+            self.assertFalse(os.path.exists(generated_dir))
+
+            custom_dir = os.path.join(temp_dir, 'custom-deploy')
+            os.makedirs(custom_dir)
+            with self.assertRaises(RuntimeError):
+                libc_tool.remove_docker_deploy_dir(custom_dir)
+            self.assertTrue(libc_tool.remove_docker_deploy_dir(custom_dir, allow_custom=True))
+
+    def test_docker_down_removes_default_deploy_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            elf_path = os.path.join(temp_dir, 'ez_shellcode')
+            with open(elf_path, 'wb') as file_obj:
+                file_obj.write(b'\x7fELF')
+            deploy_dir = libc_tool.default_docker_deploy_dir(elf_path)
+            os.makedirs(deploy_dir)
+
+            parser = libc_tool.build_cli_parser()
+            args = parser.parse_args(['docker', '--down', elf_path])
+            with mock.patch.object(libc_tool, 'run_docker_compose_action') as compose_action:
+                libc_tool.run_docker_command(args, parser)
+
+            compose_action.assert_called_once_with(deploy_dir, ['down'])
+            self.assertFalse(os.path.exists(deploy_dir))
+
+    def test_docker_destroy_yes_processes_all_targets_after_failure(self):
+        targets = [
+            {'kind': 'deployment', 'display_name': 'first'},
+            {'kind': 'image', 'display_name': 'second', 'image_name': 'libc_tool_docker_second'},
+        ]
+
+        def destroy_target(target):
+            if target is targets[0]:
+                raise RuntimeError('test failure')
+            return {
+                'mode': 'direct',
+                'deploy_dir': '',
+                'image_error': '',
+                'deploy_dir_error': '',
+                'deploy_dir_removed': False,
+            }
+
+        parser = libc_tool.build_cli_parser()
+        args = parser.parse_args(['docker', '--destroy', '-y'])
+        with mock.patch.object(libc_tool, 'collect_libc_tool_docker_targets', return_value=targets), \
+                mock.patch.object(libc_tool, 'destroy_libc_tool_docker_target', side_effect=destroy_target) as destroy:
+            with self.assertRaises(SystemExit) as exit_info:
+                libc_tool.run_docker_command(args, parser)
+
+        self.assertEqual(exit_info.exception.code, 1)
+        self.assertEqual(destroy.call_count, len(targets))
+
     def test_docker_bundle_excludes_nested_runtime_and_old_deployments(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             challenge_dir = os.path.join(temp_dir, 'challenge')
