@@ -210,6 +210,13 @@ if rg -n 'gdb_sysroot' "$gdb_dir/debug.gdb" >/dev/null; then
 fi
 rg -n "target remote 127\\.0\\.0\\.1:${gdb_debug_port}" "$gdb_dir/debug.gdb" >/dev/null
 rg -n 'LIBC_TOOL_GDB_WAIT' "$gdb_dir/debug.gdb" >/dev/null
+rg -n '^set follow-fork-mode parent$' "$gdb_dir/debug.gdb" >/dev/null
+rg -n '^set detach-on-fork on$' "$gdb_dir/debug.gdb" >/dev/null
+if rg -n '^set detach-on-fork off$' "$gdb_dir/debug.gdb" >/dev/null; then
+    printf 'gdb debug.gdb unexpectedly keeps fork children attached\n' >&2
+    exit 1
+fi
+rg -n "gdb.execute\('disconnect', to_string=True\)" "$gdb_dir/debug.gdb" >/dev/null
 rg -n "gdb.execute\('sharedlibrary', to_string=True\)" "$gdb_dir/debug.gdb" >/dev/null
 rg -n '^define libc_tool_remote$' "$gdb_dir/debug.gdb" >/dev/null
 rg -n 'set remote exec-file "/tmp/libc_tool_exec_pwn"' "$gdb_dir/debug.gdb" >/dev/null

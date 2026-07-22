@@ -164,6 +164,10 @@ class LibcToolTest(unittest.TestCase):
         self.assertNotIn("_libc_tool_gdb_quote(bundle_dir)", gdb_script)
         self.assertNotIn('.gdb_sysroot', gdb_script)
         self.assertIn('LIBC_TOOL_GDB_WAIT', gdb_script)
+        self.assertIn('set follow-fork-mode parent', gdb_script)
+        self.assertIn('set detach-on-fork on', gdb_script)
+        self.assertNotIn('set detach-on-fork off', gdb_script)
+        self.assertIn("gdb.execute('disconnect', to_string=True)", gdb_script)
         self.assertIn("gdb.execute('sharedlibrary', to_string=True)", gdb_script)
         self.assertIn('target remote 127.0.0.1:1234', gdb_script)
 
