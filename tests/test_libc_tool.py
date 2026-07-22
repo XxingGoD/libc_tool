@@ -140,6 +140,53 @@ class LibcToolTest(unittest.TestCase):
         self.assertIn('CMD xinetd -f /etc/ctf.xinetd', dockerfile)
         self.assertNotIn('CMD socat tcp-l:1337', dockerfile)
 
+    def test_docker_debug_runtime_is_scoped_and_gdb_is_retryable(self):
+        run_script = libc_tool.render_docker_run_script()
+        challenge_script = libc_tool.render_docker_challenge_script(
+            '/challenge',
+            'exec /tmp/libc_tool_exec_pwn',
+        )
+        gdb_script = libc_tool.render_docker_gdb_script(
+            'bundle/challenge/pwn',
+            'bundle/runtime',
+            'bundle/challenge',
+            enable_gdbserver=True,
+            gdb_port=1234,
+            host_port=10001,
+        )
+
+        self.assertIn('LIBC_TOOL_LIBRARY_PATH', run_script)
+        self.assertIn('gdbserver --once --wrapper env', run_script)
+        self.assertIn('export LD_LIBRARY_PATH="$runtime_library_path"', challenge_script)
+        self.assertNotIn('LD_LIBRARY_PATH:', run_script)
+        self.assertIn('bundle_dir = os.path.commonpath([challenge_dir, runtime_dir])', gdb_script)
+        self.assertIn("_libc_tool_run(f'set sysroot {bundle_dir}')", gdb_script)
+        self.assertNotIn("_libc_tool_gdb_quote(bundle_dir)", gdb_script)
+        self.assertNotIn('.gdb_sysroot', gdb_script)
+        self.assertIn('LIBC_TOOL_GDB_WAIT', gdb_script)
+        self.assertIn("gdb.execute('sharedlibrary', to_string=True)", gdb_script)
+        self.assertIn('target remote 127.0.0.1:1234', gdb_script)
+
+    def test_docker_bundle_excludes_nested_runtime_and_old_deployments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            challenge_dir = os.path.join(temp_dir, 'challenge')
+            runtime_dir = os.path.join(challenge_dir, 'libc_dir')
+            deploy_dir = os.path.join(challenge_dir, '.libc_tool_docker_current')
+            old_deploy_dir = os.path.join(challenge_dir, '.libc_tool_docker_old')
+            os.makedirs(runtime_dir)
+            os.makedirs(deploy_dir)
+            os.makedirs(old_deploy_dir)
+
+            excluded = set(libc_tool.docker_challenge_exclude_paths(
+                challenge_dir,
+                runtime_dir,
+                deploy_dir,
+            ))
+
+            self.assertIn(os.path.abspath(runtime_dir), excluded)
+            self.assertIn(os.path.abspath(deploy_dir), excluded)
+            self.assertIn(os.path.abspath(old_deploy_dir), excluded)
+
 
 if __name__ == '__main__':
     unittest.main()

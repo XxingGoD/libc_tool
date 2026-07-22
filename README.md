@@ -192,7 +192,7 @@ python3 libc_tool.py docker -y ./pwn
 - 把部署目录里的 `./bundle/challenge` 挂载到容器内 `/challenge`
 - 把部署目录里的 `./bundle/runtime` 挂载到容器内 `/runtime`
 - 容器内直接执行目标 ELF，不再显式调用自定义 `ld-linux ... --library-path ...`
-- `/runtime` 主要作为额外共享库来源，容器会把非 glibc 核心库整理到单独目录并通过 `LD_LIBRARY_PATH` 提供给题目
+- `/runtime` 主要作为额外共享库来源，容器会把非 glibc 核心库整理到单独目录；运行库路径只在目标题目进程启动时通过 `LIBC_TOOL_LIBRARY_PATH` 转换为 `LD_LIBRARY_PATH`，不会污染 `socat`、`gdbserver` 或容器内其它工具
 
 模板会影响生成的监听器和相关资产：默认 `ubuntu+socat` 使用 socat，`xinetd` 模板生成并复制 `ctf.xinetd`，`ynetd` 模板复制模板中的 `bin/ynetd`。例如：
 
@@ -222,7 +222,7 @@ python3 libc_tool.py docker -y --gdbserver --gdb-port 1234 ./pwn
 此时：
 
 - 服务端口仍然走 `--port`，默认 `10001`
-- `gdbserver` 会额外映射一个宿主机端口，默认 `1234`
+- `gdbserver` 会额外映射一个仅绑定到 `127.0.0.1` 的宿主机端口，默认 `1234`
 - 部署目录里会自动生成 `debug.gdb` 和便携启动脚本 `debug.sh`
 - 宿主机可直接：
 
@@ -235,6 +235,8 @@ python3 libc_tool.py docker -y --gdbserver --gdb-port 1234 ./pwn
 - 相对部署目录自动推导出的 ELF 路径
 - 运行库搜索路径和 `/challenge`、`/runtime` 的路径映射
 - `target remote 127.0.0.1:<gdb-port>`
+
+`debug.sh` 会在短时间内重试 GDB 连接，适合服务端口和 gdbserver 端口存在启动竞态；等待时间可通过 `LIBC_TOOL_GDB_WAIT=30` 调整。socat 调试监听器保持常驻，但同时只允许一个题目客户端/调试会话，断开后可以重新连接，不会因为一次 GDB 断开而重启整个容器。
 
 注意：容器里的题目进程仍然是由服务端口触发的，所以通常要先让 `exp` 或 `nc 127.0.0.1 <port>` 连上服务端口，再执行 `./debug.sh`。
 

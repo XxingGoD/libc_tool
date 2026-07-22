@@ -6303,6 +6303,7 @@ gdbserver_enabled=${LIBC_TOOL_GDBSERVER:-0}
 gdb_port=${LIBC_TOOL_GDB_PORT:-1234}
 gdb_prepare=${LIBC_TOOL_GDB_PREPARE:-}
 gdb_target=${LIBC_TOOL_GDB_TARGET:-}
+runtime_library_path=${LIBC_TOOL_LIBRARY_PATH:-}
 
 if [ ! -x "$launch_script" ]
 then
@@ -6328,9 +6329,17 @@ then
             echo "gdb target not found: $gdb_target" >&2
             exit 2
         fi
-        exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" gdbserver --once "0.0.0.0:${gdb_port}" "$gdb_target"
+        if [ ! -z "$runtime_library_path" ]
+        then
+            exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" \
+                gdbserver --once --wrapper env "LD_LIBRARY_PATH=${runtime_library_path}" -- \
+                "0.0.0.0:${gdb_port}" "$gdb_target"
+        fi
+        exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" \
+            gdbserver --once "0.0.0.0:${gdb_port}" "$gdb_target"
     fi
-    exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" gdbserver --once "0.0.0.0:${gdb_port}" "$launch_script"
+    exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" \
+        gdbserver --once "0.0.0.0:${gdb_port}" "$launch_script"
 fi
 
 exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" "$launch_script"
@@ -6342,6 +6351,7 @@ set -e
 
 challenge_dir={shlex.quote(challenge_dir)}
 prepare_script=/prepare_gdb_target.sh
+runtime_library_path=${{LIBC_TOOL_LIBRARY_PATH:-}}
 
 if [ ! -d "$challenge_dir" ]
 then
@@ -6355,6 +6365,12 @@ then
 fi
 
 cd "$challenge_dir"
+if [ ! -z "$runtime_library_path" ]
+then
+    export LD_LIBRARY_PATH="$runtime_library_path"
+else
+    unset LD_LIBRARY_PATH
+fi
 {command}
 """
 
@@ -6408,9 +6424,12 @@ def render_docker_gdb_script(
         "set pagination off",
         "set confirm off",
         "set breakpoint pending on",
+        "set auto-solib-add on",
         "set follow-fork-mode parent",
         "set detach-on-fork off",
         "set print thread-events off",
+        "set tcp connect-timeout 1",
+        "set remotetimeout 5",
         "python",
         "import os",
         "import gdb",
@@ -6428,42 +6447,77 @@ def render_docker_gdb_script(
         f"challenge_dir = os.path.join(deploy_dir, {normalize_portable_relpath(challenge_bundle_rel)!r})",
         f"runtime_dir = os.path.join(deploy_dir, {normalize_portable_relpath(runtime_bundle_rel)!r})",
         f"elf_path = os.path.join(deploy_dir, {normalize_portable_relpath(elf_bundle_rel)!r})",
-        "sysroot_dir = os.path.join(deploy_dir, '.gdb_sysroot')",
+        "bundle_dir = os.path.commonpath([challenge_dir, runtime_dir])",
         "solib_search_paths = ':'.join([runtime_dir, challenge_dir])",
-        "_libc_tool_run(f'set sysroot {_libc_tool_gdb_quote(sysroot_dir)}')",
-        "_libc_tool_run(f'set solib-search-path {_libc_tool_gdb_quote(solib_search_paths)}')",
-        "_libc_tool_run(f'set debug-file-directory {_libc_tool_gdb_quote(runtime_dir)}')",
+        "_libc_tool_run(f'set sysroot {bundle_dir}')",
+        "_libc_tool_run(f'set solib-search-path {solib_search_paths}')",
+        "_libc_tool_run(f'set debug-file-directory {runtime_dir}')",
         "_libc_tool_run(f'directory {_libc_tool_gdb_quote(challenge_dir)}')",
         "_libc_tool_run(f'set substitute-path {_libc_tool_gdb_quote(\"/challenge\")} {_libc_tool_gdb_quote(challenge_dir)}')",
         "_libc_tool_run(f'set substitute-path {_libc_tool_gdb_quote(\"/runtime\")} {_libc_tool_gdb_quote(runtime_dir)}')",
         "_libc_tool_run(f'set substitute-path {_libc_tool_gdb_quote(\"/tmp/libc_tool_runtime_extra\")} {_libc_tool_gdb_quote(runtime_dir)}')",
         "_libc_tool_run(f'file {_libc_tool_gdb_quote(elf_path)}')",
+        "def _libc_tool_refresh_shared_libraries(_event=None):",
+        "    try:",
+        "        gdb.execute('sharedlibrary', to_string=True)",
+        "    except gdb.error:",
+        "        pass",
+        "",
+        "try:",
+        "    gdb.events.stop.connect(_libc_tool_refresh_shared_libraries)",
+        "except AttributeError:",
+        "    pass",
         "end",
     ]
     if enable_gdbserver:
         remote_target = f"{remote_host}:{int(gdb_port)}"
         if host_port:
-            auto_message = (
-                f"libc_tool: gdbserver not ready yet. "
+            retry_message = (
+                f"libc_tool: gdbserver is not ready. "
                 f"keep one client connected to 127.0.0.1:{int(host_port)}, "
                 f"then run libc_tool_remote.\n"
             )
         else:
-            auto_message = "libc_tool: gdbserver not ready yet. Run libc_tool_remote later.\n"
+            retry_message = "libc_tool: gdbserver is not ready. Run libc_tool_remote later.\n"
         lines.extend([
             f"set remote exec-file {gdb_quote_string(remote_exec_file)}",
+            "python",
+            "import os",
+            "import time",
+            "import gdb",
+            "",
+            "def _libc_tool_remote_wait_seconds():",
+            "    try:",
+            "        value = float(os.environ.get('LIBC_TOOL_GDB_WAIT', '10'))",
+            "    except (TypeError, ValueError):",
+            "        value = 10.0",
+            "    return max(0.0, min(value, 300.0))",
+            "",
+            "def _libc_tool_connect_remote():",
+            "    deadline = time.monotonic() + _libc_tool_remote_wait_seconds()",
+            "    last_error = None",
+            "    while True:",
+            "        try:",
+            f"            gdb.execute({('target remote ' + remote_target)!r})",
+            "            _libc_tool_refresh_shared_libraries()",
+            "            return True",
+            "        except gdb.error as exc:",
+            "            last_error = exc",
+            "            if time.monotonic() >= deadline:",
+            f"                gdb.write({retry_message!r}, gdb.STDERR)",
+            "                if last_error:",
+            "                    gdb.write(f'libc_tool: {last_error}\\n', gdb.STDERR)",
+            "                return False",
+            "            time.sleep(0.25)",
+            "end",
             "define libc_tool_remote",
-            f"  target remote {remote_target}",
+            "  python _libc_tool_connect_remote()",
             "end",
             "document libc_tool_remote",
-            f"Connect to libc_tool gdbserver at {remote_target}.",
+            f"Wait for and connect to libc_tool gdbserver at {remote_target}.",
             "end",
             "python",
-            "import gdb",
-            "try:",
-            f"    gdb.execute({('target remote ' + remote_target)!r})",
-            "except gdb.error:",
-            f"    gdb.write({auto_message!r})",
+            "_libc_tool_connect_remote()",
             "end",
         ])
     else:
@@ -6576,7 +6630,11 @@ CMD {command}
     if enable_gdbserver:
         alpine_packages += " gdbserver"
         debian_packages += " gdbserver"
-    socat_listen = "tcp-l:1337,reuseaddr" if enable_gdbserver else "tcp-l:1337,reuseaddr,fork"
+    socat_listen = (
+        "tcp-l:1337,reuseaddr,fork,max-children=1"
+        if enable_gdbserver
+        else "tcp-l:1337,reuseaddr,fork"
+    )
     socat_exec = "exec:/run_pwn.sh"
     if base_image.startswith('alpine:'):
         return header + f"""FROM {base_image}
@@ -6637,7 +6695,6 @@ def render_docker_compose(config):
     runtime_mount = './' + normalize_portable_relpath(config['runtime_dir_rel'])
     lines = [
         "# docker-compose.yaml generated by libc_tool docker",
-        'version: "3"',
         "services:",
         "  pwn:",
         "    build:",
@@ -6665,7 +6722,7 @@ def render_docker_compose(config):
         f"      LIBC_TOOL_GDB_PREPARE: {yaml_quote(config['gdb_prepare_script'])}",
         f"      LIBC_TOOL_GDB_TARGET: {yaml_quote(config['gdb_target_path'])}",
         f"      LIBC_TOOL_RUNTIME_OVERLAY: {yaml_quote(config['runtime_overlay_path'])}",
-        f"      LD_LIBRARY_PATH: {yaml_quote(config['library_path_env'])}",
+        f"      LIBC_TOOL_LIBRARY_PATH: {yaml_quote(config['library_path_env'])}",
         "    ports:",
         f"      - {yaml_quote(str(config['host_port']) + ':1337')}",
         "    volumes:",
@@ -6675,7 +6732,10 @@ def render_docker_compose(config):
     if config.get('privileged'):
         lines.insert(lines.index("    environment:"), "    privileged: true")
     if config['enable_gdbserver']:
-        lines.insert(lines.index("    volumes:"), f"      - {yaml_quote(str(config['gdb_port']) + ':' + str(config['gdb_port']))}")
+        lines.insert(
+            lines.index("    volumes:"),
+            f"      - {yaml_quote('127.0.0.1:' + str(config['gdb_port']) + ':' + str(config['gdb_port']))}",
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -6789,6 +6849,28 @@ def copy_portable_tree(source_dir, target_dir, exclude_paths=None):
     reset_generated_path(target_dir)
     os.makedirs(os.path.dirname(target_dir), exist_ok=True)
     shutil.copytree(source_dir, target_dir, ignore=ignore)
+
+def docker_challenge_exclude_paths(challenge_dir, runtime_dir, deploy_dir):
+    challenge_dir = os.path.abspath(challenge_dir)
+    excluded = {os.path.abspath(deploy_dir)}
+    runtime_dir = os.path.abspath(runtime_dir)
+    try:
+        runtime_inside_challenge = (
+            runtime_dir != challenge_dir
+            and os.path.commonpath([challenge_dir, runtime_dir]) == challenge_dir
+        )
+    except ValueError:
+        runtime_inside_challenge = False
+    if runtime_inside_challenge:
+        excluded.add(runtime_dir)
+    try:
+        with os.scandir(challenge_dir) as entries:
+            for entry in entries:
+                if entry.name.startswith('.libc_tool_docker_'):
+                    excluded.add(os.path.abspath(entry.path))
+    except OSError:
+        pass
+    return sorted(excluded)
 
 def copy_docker_template_assets(deploy_dir, template_profile):
     assets = template_profile.get('assets', {})
@@ -6908,7 +6990,7 @@ def generate_docker_bundle(
         'gdb_prepare_script': '/prepare_gdb_target.sh' if enable_gdbserver else '',
         'gdb_target_path': exec_target_path if enable_gdbserver else '',
         'runtime_overlay_path': runtime_overlay_path,
-        'library_path_env': f'{runtime_overlay_path}:{challenge_root}',
+        'library_path_env': f'{runtime_overlay_path}:{runtime_root}:{challenge_root}',
         'template_name': template_name,
         'template_profile': template_profile.get('launcher'),
         'privileged': template_profile.get('privileged', False),
@@ -6916,11 +6998,14 @@ def generate_docker_bundle(
         'bundle_name': os.path.basename(os.path.normpath(deploy_dir)) or container_name,
     }
     os.makedirs(deploy_dir, exist_ok=True)
-    os.makedirs(os.path.join(deploy_dir, '.gdb_sysroot'), exist_ok=True)
     copy_portable_tree(
         challenge_dir,
         bundle_challenge_host,
-        exclude_paths=[deploy_dir],
+        exclude_paths=docker_challenge_exclude_paths(
+            challenge_dir,
+            runtime_dir,
+            deploy_dir,
+        ),
     )
     copy_portable_tree(runtime_dir, bundle_runtime_host)
     copy_docker_template_assets(deploy_dir, template_profile)

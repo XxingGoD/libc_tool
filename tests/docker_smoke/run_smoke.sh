@@ -106,7 +106,11 @@ if rg -n -- '--library-path|ld-linux' "$plain_dir/run_challenge.sh" >/dev/null; 
     exit 1
 fi
 rg -n 'LIBC_TOOL_GDBSERVER: "0"' "$plain_dir/docker-compose.yaml" >/dev/null
-rg -n 'LD_LIBRARY_PATH: "/tmp/libc_tool_runtime_extra:/challenge"' "$plain_dir/docker-compose.yaml" >/dev/null
+rg -n 'LIBC_TOOL_LIBRARY_PATH: "/tmp/libc_tool_runtime_extra:/runtime:/challenge"' "$plain_dir/docker-compose.yaml" >/dev/null
+if rg -n '^      LD_LIBRARY_PATH:' "$plain_dir/docker-compose.yaml" >/dev/null; then
+    printf 'plain compose unexpectedly exports LD_LIBRARY_PATH globally\n' >&2
+    exit 1
+fi
 rg -n 'LIBC_TOOL_GDB_TARGET: ""' "$plain_dir/docker-compose.yaml" >/dev/null
 rg -n '\./bundle/challenge:/challenge' "$plain_dir/docker-compose.yaml" >/dev/null
 rg -n '\./bundle/runtime:/runtime' "$plain_dir/docker-compose.yaml" >/dev/null
@@ -175,7 +179,7 @@ do
 done
 
 rg -n 'gdbserver' "$gdb_dir/Dockerfile" >/dev/null
-rg -n 'CMD socat tcp-l:1337,reuseaddr exec:/run_pwn\.sh' "$gdb_dir/Dockerfile" >/dev/null
+rg -n 'CMD socat tcp-l:1337,reuseaddr,fork,max-children=1 exec:/run_pwn\.sh' "$gdb_dir/Dockerfile" >/dev/null
 rg -n 'chmod 755 /run_pwn\.sh' "$gdb_dir/Dockerfile" >/dev/null
 rg -n 'chmod 755 /run_challenge\.sh' "$gdb_dir/Dockerfile" >/dev/null
 rg -n "${gdb_debug_port}:${gdb_debug_port}" "$gdb_dir/docker-compose.yaml" >/dev/null
@@ -183,10 +187,14 @@ rg -n 'LIBC_TOOL_GDBSERVER: "1"' "$gdb_dir/docker-compose.yaml" >/dev/null
 rg -n "LIBC_TOOL_GDB_PORT: \"${gdb_debug_port}\"" "$gdb_dir/docker-compose.yaml" >/dev/null
 rg -n 'LIBC_TOOL_GDB_PREPARE: "/prepare_gdb_target\.sh"' "$gdb_dir/docker-compose.yaml" >/dev/null
 rg -n 'LIBC_TOOL_GDB_TARGET: "/tmp/libc_tool_exec_pwn"' "$gdb_dir/docker-compose.yaml" >/dev/null
-rg -n 'LD_LIBRARY_PATH: "/tmp/libc_tool_runtime_extra:/challenge"' "$gdb_dir/docker-compose.yaml" >/dev/null
+rg -n 'LIBC_TOOL_LIBRARY_PATH: "/tmp/libc_tool_runtime_extra:/runtime:/challenge"' "$gdb_dir/docker-compose.yaml" >/dev/null
+if rg -n '^      LD_LIBRARY_PATH:' "$gdb_dir/docker-compose.yaml" >/dev/null; then
+    printf 'gdb compose unexpectedly exports LD_LIBRARY_PATH globally\n' >&2
+    exit 1
+fi
 rg -n '\./bundle/challenge:/challenge' "$gdb_dir/docker-compose.yaml" >/dev/null
 rg -n '\./bundle/runtime:/runtime' "$gdb_dir/docker-compose.yaml" >/dev/null
-rg -n 'gdbserver --once "0\.0\.0\.0:\$\{gdb_port\}"' "$gdb_dir/run_pwn.sh" >/dev/null
+rg -n 'gdbserver --once --wrapper env "LD_LIBRARY_PATH=\$\{runtime_library_path\}" --' "$gdb_dir/run_pwn.sh" >/dev/null
 rg -n 'elf_source=/challenge/pwn' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'exec_target=/tmp/libc_tool_exec_pwn' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'cp -f "\$elf_source" "\$exec_target"' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
@@ -194,7 +202,15 @@ rg -n 'chmod 755 "\$exec_target"' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'cp -Lf ' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n '/tmp/libc_tool_runtime_extra' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n "LIBC_TOOL_DEPLOY_DIR" "$gdb_dir/debug.sh" >/dev/null
+rg -n 'bundle_dir = os\.path\.commonpath\(\[challenge_dir, runtime_dir\]\)' "$gdb_dir/debug.gdb" >/dev/null
+rg -n "_libc_tool_run\(f'set sysroot" "$gdb_dir/debug.gdb" >/dev/null
+if rg -n 'gdb_sysroot' "$gdb_dir/debug.gdb" >/dev/null; then
+    printf 'gdb script unexpectedly uses an empty local sysroot directory\n' >&2
+    exit 1
+fi
 rg -n "target remote 127\\.0\\.0\\.1:${gdb_debug_port}" "$gdb_dir/debug.gdb" >/dev/null
+rg -n 'LIBC_TOOL_GDB_WAIT' "$gdb_dir/debug.gdb" >/dev/null
+rg -n "gdb.execute\('sharedlibrary', to_string=True\)" "$gdb_dir/debug.gdb" >/dev/null
 rg -n '^define libc_tool_remote$' "$gdb_dir/debug.gdb" >/dev/null
 rg -n 'set remote exec-file "/tmp/libc_tool_exec_pwn"' "$gdb_dir/debug.gdb" >/dev/null
 rg -n "bundle/challenge" "$gdb_dir/debug.gdb" >/dev/null
