@@ -12,8 +12,8 @@
 
 - Python 3
 - `pwntools`
-- `unix_ar`
-- `zstandard`
+- `patchelf`（执行 `patch` 时需要）
+- `unix_ar` 或系统 `ar`；`data.tar.zst` 还需要 `zstandard`
 - `eu-unstrip`（来自 `elfutils`，用于把 `libc6-dbg` / `libc6-dbgsym` 合并成未 strip 的 libc）
 - `readelf`、`objdump`、`strings`
 - 可选：`docker compose` 或 `docker-compose`，用于一键启动容器调试环境
@@ -68,8 +68,8 @@ python3 libc_tool.py rebuild-index
 
 
 ```bash
-git clone https://github.com/niklasb/libc-database.git /home/starlight/CtfTools/libc-database
-cd /home/starlight/CtfTools/libc-database
+git clone https://github.com/niklasb/libc-database.git ./libc-database
+cd ./libc-database
 ./get ubuntu
 ```
 
@@ -88,17 +88,20 @@ export PWN_DEBIAN_OLD_RELEASES_URL=https://archive.debian.org/debian
 export PWN_DEBIAN_OLD_SECURITY_URL=https://archive.debian.org/debian-security
 export PWN_DEBIAN_DEBUG_URL=https://deb.debian.org/debian-debug
 export PWN_DEBIAN_OLD_DEBUG_URL=https://archive.debian.org/debian-debug
-export PWN_UBUNTU_DDEBS_URL=http://ddebs.ubuntu.com
+export PWN_UBUNTU_DDEBS_URL=https://ddebs.ubuntu.com
 ```
 
-当前代码里硬编码全局变量：
+数据库和缓存路径支持环境变量，默认会自动发现仓库旁边或 `~/CtfTools` 下的数据库：
 
-```python
-LIBC_DB_PATH = "/home/starlight/CtfTools/libc-database/db"
-LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
+```bash
+export LIBC_TOOL_DB_PATH=/path/to/libc-database/db
+export LIBC_TOOL_INDEX_CACHE=/path/to/libc-database/db/.index_cache.json
+export LIBC_TOOL_CORE=/path/to/libc_tool_core
+export LIBC_TOOL_CACHE_DIR=/path/to/libc_tool-cache
+export LIBC_TOOL_TEMPLATE_ROOT=/path/to/deploy_pwn_template
 ```
 
-路径需要绝对路径
+所有路径会在读取时转换为绝对路径。
 
 ## 匹配排序
 
@@ -183,13 +186,20 @@ python3 libc_tool.py docker -y ./pwn
 
 - 自动匹配并准备运行库
 - 根据匹配到的 `libc/ld` 推断尽量匹配的 Ubuntu 基础镜像版本
-- 在目标 ELF 同目录下生成一套基于 `./deploy_pwn_template/ubuntu+socat` 风格的部署目录；若仓库内未携带模板，则回退到 `/home/starlight/CTF/deploy_pwn_template/ubuntu+socat`
+- 在目标 ELF 同目录下生成一套部署目录；模板来自 `--template` 指定的仓库模板，仓库内没有模板时才回退到 `LIBC_TOOL_TEMPLATE_ROOT`
 - 生成的部署目录会自带 `bundle/challenge` 和 `bundle/runtime`，`docker-compose.yaml` 使用相对路径挂载；整个目录可直接复制到别的 Linux 上继续 `docker compose up -d --build`
 - 默认把宿主机 `10001` 端口映射到容器内 `1337`
 - 把部署目录里的 `./bundle/challenge` 挂载到容器内 `/challenge`
 - 把部署目录里的 `./bundle/runtime` 挂载到容器内 `/runtime`
 - 容器内直接执行目标 ELF，不再显式调用自定义 `ld-linux ... --library-path ...`
 - `/runtime` 主要作为额外共享库来源，容器会把非 glibc 核心库整理到单独目录并通过 `LD_LIBRARY_PATH` 提供给题目
+
+模板会影响生成的监听器和相关资产：默认 `ubuntu+socat` 使用 socat，`xinetd` 模板生成并复制 `ctf.xinetd`，`ynetd` 模板复制模板中的 `bin/ynetd`。例如：
+
+```bash
+python3 libc_tool.py docker --template ubuntu+xinetd+chroot -y --generate-only ./pwn
+python3 libc_tool.py docker --template alpine+ynetd+chroot+patchelf2 -y --generate-only ./pwn
+```
 
 只生成部署文件、不立即启动容器：
 
@@ -287,7 +297,9 @@ bash tests/docker_smoke/run_smoke.sh
 python3 libc_tool.py download ./libc.so
 ```
 
-`--download` 会尽量下载并合并未 strip 的 libc：先拿 `libc6` 包，再找对应的 `libc6-dbg` / `libc6-dbgsym` 或 debuginfod 符号。若最终输出目录中没有带 `.symtab` / `.debug_info` 的 libc，会返回失败，而不是静默接受 stripped libc。
+`download` 会尽量下载并合并未 strip 的 libc：先拿 `libc6` 包，再找对应的 `libc6-dbg` / `libc6-dbgsym` 或 debuginfod 符号。若最终输出目录中没有带 `.symtab` / `.debug_info` 的 libc，会返回失败，而不是静默接受 stripped libc。
+
+Debian/Ubuntu `Packages` 索引中的 `SHA256` 和 `Size` 会随候选 URL 保存。下载前校验包完整性，缓存目录只有在完成标记匹配时才会复用；没有索引元数据的本地 `.url` 回退源会明确提示仅进行内容哈希记录。
 
 下载运行库并补程序依赖：
 
@@ -329,7 +341,7 @@ python3 libc_tool.py download --output-dir ./my_libs --elf ./pwn ./libc.so
 下载完成后直接 patch 目标 ELF：
 
 ```bash
-python3 libc_tool.py patch --elf ./pwn --libc ./libc.so
+python3 libc_tool.py patch ./pwn --libc ./libc.so
 ```
 
 如果你本地已经有准备好的 `libc_dir`，不想再下载 libc，可以直接 patch：
@@ -353,7 +365,15 @@ python3 libc_tool.py patch --libc ./libc.so --patch-mode replace-needed ./pwn
 patch 时会：
 
 - 为目标 ELF 生成 `./pwn.bak`
+- 默认把运行库复制到 `./libc_dir.libc_tool_patched`，只修改隔离副本，不改动原始运行库目录
+- 生成 `./pwn.libc_tool.patch.json`，记录原始/patch 后 ELF 哈希、运行库路径和受管理文件
 - 默认用目标 loader 执行 `--list` 做一次依赖解析验证
+
+只有明确指定下面的选项时才会原地修改运行库；此模式仍会创建运行库备份并由 `restore` 校验后回滚：
+
+```bash
+python3 libc_tool.py patch ./pwn --dir ./libc_dir --in-place-runtime
+```
 
 恢复原始 ELF：
 
@@ -373,7 +393,7 @@ python3 libc_tool.py rebuild-index
 python3 libc_tool.py clear-cache
 ```
 
-`--clear-cache` / `-C` 只清理工具缓存，不删除题目目录里的 `libc_dir`。清理范围包括：
+`clear-cache` 只清理工具缓存，不删除题目目录里的 `libc_dir`。清理范围包括：
 
 - pwntools cache 下的 `libc_tool_extra_libs`
 - `libcdb_libs`
@@ -404,7 +424,7 @@ patchelf --set-interpreter "$PWD/libc_dir/ld-linux-x86-64.so.2" ./pwn
 patchelf --force-rpath --set-rpath '$ORIGIN/libc_dir:$ORIGIN' ./pwn
 ```
 
-如果使用 `--patch`，工具会自动做上面的 interpreter/RPATH 处理；仍建议在 patch 后自己再跑一次：
+如果使用 `patch`，工具会自动做上面的 interpreter/RPATH 处理；仍建议在 patch 后自己再跑一次：
 
 ```bash
 ./libc_dir/ld-linux-x86-64.so.2 --library-path ./libc_dir:. --list ./pwn

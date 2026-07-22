@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Rust core
+        run: cargo build --release
+      - name: Python syntax and unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 -c "compile(open('libc_tool.py', encoding='utf-8').read(), 'libc_tool.py', 'exec')"
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: CLI smoke checks
+        run: |
+          python3 libc_tool.py --help
+          python3 libc_tool.py core-info
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Docker generation smoke test
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: bash tests/docker_smoke/run_smoke.sh

@@ -591,19 +591,47 @@ fn filter_package_urls(args: &[String]) {
             .get(package.as_str())
             .unwrap_or(&package_order.len());
         let arch_score = if entry_arch == arch { 0 } else { 1 };
-        matches.push((package_rank, arch_score, filename.clone()));
+        matches.push((
+            package_rank,
+            arch_score,
+            package.clone(),
+            entry.get("Version").cloned().unwrap_or_default(),
+            entry_arch.clone(),
+            filename.clone(),
+            entry.get("SHA256").cloned().unwrap_or_default(),
+            entry.get("Size").cloned().unwrap_or_default(),
+        ));
     }
 
     matches.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
     let mut seen = HashSet::new();
-    for (_package_rank, _arch_score, filename) in matches {
+    for (
+        _package_rank,
+        _arch_score,
+        package,
+        version,
+        entry_arch,
+        filename,
+        sha256,
+        size,
+    ) in matches
+    {
         let url = format!(
             "{}/{}",
             repo_root.trim_end_matches('/'),
             filename.trim_start_matches('/')
         );
         if seen.insert(url.clone()) {
-            println!("{url}");
+            println!(
+                "{{\"package_url\":{},\"package_name\":{},\"package_version\":{},\"package_arch\":{},\"package_filename\":{},\"package_sha256\":{},\"package_size\":{}}}",
+                json_string(&url),
+                json_string(&package),
+                json_string(&version),
+                json_string(&entry_arch),
+                json_string(filename.rsplit('/').next().unwrap_or(filename.as_str())),
+                json_string(&sha256),
+                json_string(&size),
+            );
         }
     }
 }
@@ -759,6 +787,7 @@ struct IndexEntry {
     arch: String,
     version: Option<String>,
     info: String,
+    package_url: Option<String>,
     symbol_suffixes: BTreeMap<String, String>,
 }
 
@@ -773,6 +802,10 @@ fn build_index_entry(
         .unwrap_or_default()
         .trim()
         .to_string();
+    let package_url = fs::read_to_string(db_path.join(format!("{entry_id}.url")))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let symbol_suffixes =
         load_symbol_suffixes(&db_path.join(format!("{entry_id}.symbols")), common_symbols);
     let elf_info = parse_elf_info(&so_path);
@@ -792,6 +825,7 @@ fn build_index_entry(
         arch,
         version,
         info,
+        package_url,
         symbol_suffixes,
     })
 }
@@ -819,7 +853,7 @@ fn json_entry(entry: &IndexEntry) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"id\":{},\"path\":{},\"build_id\":{},\"sha1\":{},\"arch\":{},\"version\":{},\"info\":{},\"symbol_suffixes\":{{{}}}}}",
+        "{{\"id\":{},\"path\":{},\"build_id\":{},\"sha1\":{},\"arch\":{},\"version\":{},\"info\":{},\"package_url\":{},\"symbol_suffixes\":{{{}}}}}",
         json_string(&entry.id),
         json_string(&entry.path),
         json_option_string(entry.build_id.as_deref()),
@@ -827,6 +861,7 @@ fn json_entry(entry: &IndexEntry) -> String {
         json_string(&entry.arch),
         json_option_string(entry.version.as_deref()),
         json_string(&entry.info),
+        json_option_string(entry.package_url.as_deref()),
         symbol_suffixes
     )
 }

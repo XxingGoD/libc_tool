@@ -18,6 +18,7 @@ import urllib.error
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from urllib.parse import urlsplit, urlunsplit
 
 ORIGINAL_ARGV = sys.argv[1:]
 PWN_IMPORT_ERROR = None
@@ -98,17 +99,49 @@ except Exception as e:
     libcdb = None
 
 
-LIBC_DB_PATH = "/home/starlight/CtfTools/libc-database/db"
-LIBC_INDEX_CACHE = "/home/starlight/CtfTools/libc-database/db/.index_cache.json"
-DOCKER_TEMPLATE_ROOT = "/home/starlight/CTF/deploy_pwn_template"
-LOCAL_DOCKER_TEMPLATE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deploy_pwn_template')
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def configured_path(env_name, default_path):
+    value = os.environ.get(env_name)
+    if value:
+        return os.path.abspath(os.path.expanduser(value))
+    return os.path.abspath(os.path.expanduser(default_path))
+
+
+def discover_libc_database_path():
+    configured = os.environ.get('LIBC_TOOL_DB_PATH')
+    if configured:
+        return configured_path('LIBC_TOOL_DB_PATH', configured)
+    candidates = [
+        os.path.join(PROJECT_ROOT, '..', 'libc-database', 'db'),
+        os.path.expanduser('~/CtfTools/libc-database/db'),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    return os.path.abspath(os.path.expanduser('~/CtfTools/libc-database/db'))
+
+
+LIBC_DB_PATH = discover_libc_database_path()
+LIBC_INDEX_CACHE = configured_path(
+    'LIBC_TOOL_INDEX_CACHE',
+    os.path.join(LIBC_DB_PATH, '.index_cache.json'),
+)
+DOCKER_TEMPLATE_ROOT = configured_path(
+    'LIBC_TOOL_TEMPLATE_ROOT',
+    os.path.expanduser('~/CTF/deploy_pwn_template'),
+)
+LOCAL_DOCKER_TEMPLATE_ROOT = os.path.join(PROJECT_ROOT, 'deploy_pwn_template')
 DOCKER_BUNDLE_DIRNAME = 'bundle'
 DOCKER_BUNDLE_CHALLENGE_DIRNAME = 'challenge'
 DOCKER_BUNDLE_RUNTIME_DIRNAME = 'runtime'
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 6
 INDEX_BUILD_MAX_WORKERS = 8
 FILE_ANALYSIS_CACHE = {}
 ELF_FAST_INFO_CACHE = {}
+PACKAGE_METADATA_CACHE = {}
+PACKAGE_CACHE_MARKER = '.libc_tool_complete.json'
 COMMON_LIBC_SYMBOLS = [
     '__libc_start_main',
     'system',
@@ -239,7 +272,10 @@ ANSI_CODES = {
 }
 
 PATCH_BACKUP_SUFFIX = '.bak'
-PATCH_SCHEMA_VERSION = 1
+PATCH_MANIFEST_SUFFIX = '.libc_tool.patch.json'
+PATCH_RUNTIME_SUFFIX = '.libc_tool_patched'
+PATCH_RUNTIME_BACKUP_SUFFIX = '.libc_tool_runtime_backup'
+PATCH_SCHEMA_VERSION = 2
 DOCKER_MANAGED_LABEL = 'libc_tool.managed'
 DOCKER_MANAGED_CONTAINER_PREFIX = 'libc-tool-'
 DOCKER_MANAGED_IMAGE_PREFIX = 'libc_tool_docker_'
@@ -309,6 +345,16 @@ def stderr_hint(text):
     return stderr_style(text, "bold", "green")
 
 def ensure_pwntools_cache_dir():
+    configured_cache = os.environ.get('LIBC_TOOL_CACHE_DIR')
+    if configured_cache:
+        cache_dir = os.path.abspath(os.path.expanduser(configured_cache))
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError:
+            return None
+        if os.access(cache_dir, os.W_OK):
+            context.cache_dir = cache_dir
+            return cache_dir
     if context.cache_dir:
         return context.cache_dir
     cache_bases = [
@@ -1089,12 +1135,45 @@ def format_patch_transition(before, after, formatter=None, missing='-'):
 def get_patch_backup_path(elf_path):
     return os.path.abspath(elf_path) + PATCH_BACKUP_SUFFIX
 
+def get_patch_manifest_path(elf_path):
+    return os.path.abspath(elf_path) + PATCH_MANIFEST_SUFFIX
+
+def get_isolated_runtime_dir(target_dir):
+    return os.path.abspath(target_dir) + PATCH_RUNTIME_SUFFIX
+
+def get_runtime_backup_dir(target_dir):
+    return os.path.abspath(target_dir) + PATCH_RUNTIME_BACKUP_SUFFIX
+
 def sha256_of_file(file_path):
     h = hashlib.sha256()
     with open(file_path, 'rb') as f:
         for chunk in iter(lambda: f.read(8192), b''):
             h.update(chunk)
     return h.hexdigest()
+
+def sha256_of_path(path):
+    if os.path.islink(path):
+        return hashlib.sha256(os.readlink(path).encode()).hexdigest()
+    return sha256_of_file(path)
+
+def runtime_tree_fingerprint(root_dir):
+    root_dir = os.path.abspath(root_dir)
+    digest = hashlib.sha256()
+    if not os.path.isdir(root_dir):
+        return None
+    for current_root, dirs, files in os.walk(root_dir, followlinks=False):
+        dirs[:] = sorted(name for name in dirs if not os.path.islink(os.path.join(current_root, name)))
+        for file_name in sorted(files):
+            file_path = os.path.join(current_root, file_name)
+            relative = os.path.relpath(file_path, root_dir).replace(os.sep, '/')
+            digest.update(relative.encode())
+            digest.update(b'\0')
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                digest.update(sha256_of_path(file_path).encode())
+            else:
+                digest.update(b'<non-regular>')
+            digest.update(b'\0')
+    return digest.hexdigest()
 
 def get_program_interpreter(elf_path):
     if not elf_path or not os.path.exists(elf_path) or not is_elf_file(elf_path):
@@ -1159,17 +1238,181 @@ def backup_patch_target(elf_path):
     elf_path = os.path.abspath(elf_path)
     backup_path = get_patch_backup_path(elf_path)
     if os.path.exists(backup_path):
+        manifest_path = get_patch_manifest_path(elf_path)
+        if not os.path.exists(manifest_path):
+            raise RuntimeError(
+                f"已有未登记的 patch 备份: {backup_path}; "
+                "请先确认并恢复/移走该文件，避免误用旧备份"
+            )
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as manifest_file:
+                manifest = json.load(manifest_file)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"patch manifest 无法读取: {manifest_path}") from exc
+        if manifest.get('elf_original_sha256') != sha256_of_file(backup_path):
+            raise RuntimeError(f"patch manifest 与备份 ELF 不匹配: {backup_path}")
         log.info(f"复用已有 patch 备份: {stderr_path(backup_path)}")
         return backup_path
     shutil.copy2(elf_path, backup_path)
     log.info(f"创建 patch 备份: {stderr_path(backup_path)}")
     return backup_path
 
+def write_patch_manifest(elf_path, manifest):
+    manifest_path = get_patch_manifest_path(elf_path)
+    temp_path = manifest_path + '.tmp'
+    with open(temp_path, 'w', encoding='utf-8') as manifest_file:
+        json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+        manifest_file.write('\n')
+    os.replace(temp_path, manifest_path)
+
+def read_patch_manifest(elf_path):
+    manifest_path = get_patch_manifest_path(elf_path)
+    if not os.path.exists(manifest_path):
+        return None
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as manifest_file:
+            manifest = json.load(manifest_file)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"patch manifest 无法读取: {manifest_path}") from exc
+    if not isinstance(manifest, dict) or manifest.get('schema_version') != PATCH_SCHEMA_VERSION:
+        raise RuntimeError(f"不支持的 patch manifest: {manifest_path}")
+    return manifest
+
+def replace_file_atomically(source_path, target_path):
+    target_path = os.path.abspath(target_path)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=os.path.basename(target_path) + '.replace.',
+        suffix='.tmp',
+        dir=os.path.dirname(target_path),
+    )
+    os.close(fd)
+    try:
+        shutil.copy2(source_path, temp_path)
+        os.replace(temp_path, target_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+def prepare_isolated_runtime_dir(source_dir, isolated_dir, elf_path):
+    source_dir = os.path.abspath(source_dir)
+    isolated_dir = os.path.abspath(isolated_dir)
+    if os.path.exists(isolated_dir):
+        manifest = read_patch_manifest(elf_path)
+        if not manifest or manifest.get('isolated_runtime_dir') != isolated_dir:
+            raise RuntimeError(
+                f"隔离运行库目录已存在但未被当前 patch 管理: {isolated_dir}"
+            )
+        if manifest.get('source_runtime_sha256') != runtime_tree_fingerprint(source_dir):
+            raise RuntimeError("源运行库已变化，拒绝复用旧的隔离 patch 目录")
+        return False
+    try:
+        if os.path.commonpath([source_dir, isolated_dir]) == source_dir:
+            raise RuntimeError("隔离运行库目录不能位于源运行库目录内")
+    except ValueError:
+        pass
+    shutil.copytree(source_dir, isolated_dir, symlinks=False)
+    return True
+
+def snapshot_managed_runtime_files(runtime_paths, runtime_dir, field_name):
+    snapshot = []
+    runtime_dir = os.path.abspath(runtime_dir)
+    for path in sorted(set(runtime_paths)):
+        if not os.path.isfile(path):
+            continue
+        relative = os.path.relpath(path, runtime_dir).replace(os.sep, '/')
+        snapshot.append({
+            'path': relative,
+            field_name: sha256_of_file(path),
+        })
+    return snapshot
+
+def backup_managed_runtime_files(runtime_paths, runtime_dir, backup_dir):
+    backup_dir = os.path.abspath(backup_dir)
+    if os.path.exists(backup_dir):
+        raise RuntimeError(
+            f"已有未登记的运行库备份目录: {backup_dir}; "
+            "请先确认并恢复/移走该目录"
+        )
+    os.makedirs(backup_dir, exist_ok=True)
+    try:
+        for path in sorted(set(runtime_paths)):
+            if not os.path.isfile(path):
+                continue
+            relative = os.path.relpath(path, os.path.abspath(runtime_dir))
+            backup_path = os.path.join(backup_dir, relative)
+            os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+            shutil.copy2(path, backup_path)
+    except Exception:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        raise
+    return backup_dir
+
+def restore_managed_runtime_files(manifest):
+    runtime_dir = os.path.abspath(manifest['source_runtime_dir'])
+    backup_dir = os.path.abspath(manifest['runtime_backup_dir'])
+    if runtime_dir == os.path.abspath(os.sep) or backup_dir != get_runtime_backup_dir(runtime_dir):
+        raise RuntimeError("patch manifest 的运行库备份路径无效")
+    if not os.path.isdir(backup_dir):
+        raise RuntimeError(f"运行库备份目录不存在: {backup_dir}")
+    restore_items = []
+    for item in manifest.get('managed_files', []):
+        relative = item.get('path')
+        if not relative or os.path.isabs(relative) or '..' in relative.split('/'):
+            raise RuntimeError(f"patch manifest 含非法运行库路径: {relative}")
+        target_path = os.path.abspath(os.path.join(runtime_dir, relative))
+        backup_path = os.path.abspath(os.path.join(backup_dir, relative))
+        if os.path.commonpath([runtime_dir, target_path]) != runtime_dir:
+            raise RuntimeError(f"patch manifest 含越界运行库路径: {relative}")
+        if os.path.commonpath([backup_dir, backup_path]) != backup_dir:
+            raise RuntimeError(f"patch manifest 含越界备份路径: {relative}")
+        if not os.path.isfile(backup_path):
+            raise RuntimeError(f"运行库备份文件不存在: {backup_path}")
+        after_sha256 = item.get('after_sha256')
+        if after_sha256 and os.path.isfile(target_path) and sha256_of_file(target_path) != after_sha256:
+            raise RuntimeError(f"运行库文件已被外部修改，拒绝恢复: {target_path}")
+        restore_items.append((backup_path, target_path))
+    for backup_path, target_path in restore_items:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        replace_file_atomically(backup_path, target_path)
+
 def restore_patched_elf(elf_path):
     elf_path = os.path.abspath(elf_path)
     backup_path = get_patch_backup_path(elf_path)
     if not os.path.exists(backup_path):
         raise RuntimeError(f"patch backup not found: {backup_path}")
+    manifest = read_patch_manifest(elf_path)
+    if manifest:
+        if os.path.abspath(manifest.get('elf_path', '')) != elf_path:
+            raise RuntimeError("patch manifest 与目标 ELF 不匹配")
+        if sha256_of_file(backup_path) != manifest.get('elf_original_sha256'):
+            raise RuntimeError("patch 备份 ELF 校验失败，拒绝恢复")
+        if sha256_of_file(elf_path) != manifest.get('elf_patched_sha256'):
+            raise RuntimeError("当前 ELF 已被外部修改，拒绝覆盖")
+        if manifest.get('in_place_runtime'):
+            runtime_dir = os.path.abspath(manifest.get('source_runtime_dir', ''))
+            if not runtime_dir or runtime_dir == os.path.abspath(os.sep):
+                raise RuntimeError("patch manifest 的运行库目录无效")
+            restore_managed_runtime_files(manifest)
+        else:
+            source_runtime_dir = os.path.abspath(manifest.get('source_runtime_dir', ''))
+            isolated_runtime_dir = os.path.abspath(manifest.get('isolated_runtime_dir', ''))
+            if source_runtime_dir == os.path.abspath(os.sep):
+                raise RuntimeError("patch manifest 的源运行库目录无效")
+            expected_isolated = get_isolated_runtime_dir(source_runtime_dir)
+            if isolated_runtime_dir != expected_isolated or isolated_runtime_dir == source_runtime_dir:
+                raise RuntimeError("patch manifest 的隔离运行库路径无效")
+            if os.path.isdir(isolated_runtime_dir):
+                expected_runtime_sha256 = manifest.get('patched_runtime_sha256')
+                if expected_runtime_sha256 and runtime_tree_fingerprint(isolated_runtime_dir) != expected_runtime_sha256:
+                    raise RuntimeError("隔离运行库已被外部修改，拒绝删除")
+                shutil.rmtree(isolated_runtime_dir)
+        replace_file_atomically(backup_path, elf_path)
+        os.unlink(backup_path)
+        runtime_backup_dir = manifest.get('runtime_backup_dir')
+        if runtime_backup_dir and os.path.isdir(runtime_backup_dir):
+            shutil.rmtree(runtime_backup_dir)
+        os.unlink(get_patch_manifest_path(elf_path))
+        return elf_path
     fd, tmp_path = tempfile.mkstemp(
         prefix=os.path.basename(elf_path) + '.restore.',
         suffix='.tmp',
@@ -1350,11 +1593,63 @@ def verify_patch_plan(plan):
         raise RuntimeError(f"loader verification failed: {detail or 'unknown error'}")
     return result.stdout
 
-def patch_elf_with_runtime_dir(elf_path, target_dir, mode='rpath', verify=True, extra_needed=None):
+def patch_elf_with_runtime_dir(
+    elf_path,
+    target_dir,
+    mode='rpath',
+    verify=True,
+    extra_needed=None,
+    in_place_runtime=False,
+):
     elf_path = os.path.abspath(elf_path)
-    plan = build_patch_plan(elf_path, target_dir, mode=mode, extra_needed=extra_needed)
-    backup_path = backup_patch_target(elf_path)
-    original_state = snapshot_patch_target_state(backup_path)
+    source_runtime_dir = os.path.abspath(target_dir)
+    source_runtime_sha256 = runtime_tree_fingerprint(source_runtime_dir)
+    manifest_path = get_patch_manifest_path(elf_path)
+    if os.path.exists(manifest_path):
+        raise RuntimeError(
+            f"目标 ELF 已由 libc_tool patch 管理: {manifest_path}; 请先执行 restore"
+        )
+    runtime_dir = source_runtime_dir
+    isolated_runtime_dir = None
+    isolated_created = False
+    backup_existed = os.path.exists(get_patch_backup_path(elf_path))
+    backup_path = None
+    plan = None
+    try:
+        if not in_place_runtime:
+            isolated_runtime_dir = get_isolated_runtime_dir(source_runtime_dir)
+            isolated_created = prepare_isolated_runtime_dir(
+                source_runtime_dir,
+                isolated_runtime_dir,
+                elf_path,
+            )
+            runtime_dir = isolated_runtime_dir
+        plan = build_patch_plan(elf_path, runtime_dir, mode=mode, extra_needed=extra_needed)
+        plan['source_runtime_dir'] = source_runtime_dir
+        plan['isolated_runtime_dir'] = isolated_runtime_dir
+        plan['in_place_runtime'] = bool(in_place_runtime)
+        plan['runtime_backup_dir'] = None
+        backup_path = backup_patch_target(elf_path)
+        original_state = snapshot_patch_target_state(backup_path)
+        managed_before = snapshot_managed_runtime_files(
+            plan.get('patch_libraries', ()),
+            runtime_dir,
+            'before_sha256',
+        )
+        if in_place_runtime:
+            plan['runtime_backup_dir'] = backup_managed_runtime_files(
+                plan.get('patch_libraries', ()),
+                runtime_dir,
+                get_runtime_backup_dir(source_runtime_dir),
+            )
+    except Exception:
+        if plan and plan.get('runtime_backup_dir'):
+            shutil.rmtree(plan['runtime_backup_dir'], ignore_errors=True)
+        if isolated_created and isolated_runtime_dir and os.path.isdir(isolated_runtime_dir):
+            shutil.rmtree(isolated_runtime_dir)
+        if backup_path and not backup_existed and os.path.exists(backup_path):
+            os.unlink(backup_path)
+        raise
     fd, staged_path = tempfile.mkstemp(
         prefix=os.path.basename(elf_path) + '.patch.',
         suffix='.tmp',
@@ -1368,12 +1663,60 @@ def patch_elf_with_runtime_dir(elf_path, target_dir, mode='rpath', verify=True, 
         if verify:
             verify_patch_plan(plan)
         os.replace(staged_path, elf_path)
+    except Exception:
+        if in_place_runtime and plan.get('runtime_backup_dir'):
+            for item in managed_before:
+                relative = item['path']
+                backup_file = os.path.join(plan['runtime_backup_dir'], relative)
+                target_file = os.path.join(runtime_dir, relative)
+                if os.path.isfile(backup_file):
+                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                    shutil.copy2(backup_file, target_file)
+            shutil.rmtree(plan['runtime_backup_dir'], ignore_errors=True)
+        elif isolated_created and isolated_runtime_dir and os.path.isdir(isolated_runtime_dir):
+            shutil.rmtree(isolated_runtime_dir)
+        if not backup_existed and os.path.exists(backup_path):
+            os.unlink(backup_path)
+        raise
     finally:
         if os.path.exists(staged_path):
             os.unlink(staged_path)
     patched_state = snapshot_patch_target_state(elf_path)
     plan['original_state'] = original_state
     plan['patched_state'] = patched_state
+    managed_after = snapshot_managed_runtime_files(
+        plan.get('patch_libraries', ()),
+        runtime_dir,
+        'after_sha256',
+    )
+    managed_by_path = {item['path']: item for item in managed_before}
+    for item in managed_after:
+        managed_by_path.setdefault(item['path'], {}).update(item)
+    manifest = {
+        'schema_version': PATCH_SCHEMA_VERSION,
+        'elf_path': elf_path,
+        'elf_original_sha256': original_state['sha256'],
+        'elf_patched_sha256': patched_state['sha256'],
+        'source_runtime_dir': source_runtime_dir,
+        'isolated_runtime_dir': isolated_runtime_dir,
+        'source_runtime_sha256': source_runtime_sha256,
+        'patched_runtime_sha256': runtime_tree_fingerprint(runtime_dir),
+        'in_place_runtime': bool(in_place_runtime),
+        'runtime_backup_dir': plan.get('runtime_backup_dir'),
+        'managed_files': [managed_by_path[key] for key in sorted(managed_by_path)],
+    }
+    try:
+        write_patch_manifest(elf_path, manifest)
+    except Exception:
+        if in_place_runtime and plan.get('runtime_backup_dir'):
+            restore_managed_runtime_files({**manifest, 'managed_files': managed_after})
+            shutil.rmtree(plan['runtime_backup_dir'], ignore_errors=True)
+        elif isolated_created and isolated_runtime_dir and os.path.isdir(isolated_runtime_dir):
+            shutil.rmtree(isolated_runtime_dir)
+        if not backup_existed and os.path.exists(backup_path):
+            os.unlink(backup_path)
+        raise
+    plan['manifest_path'] = manifest_path
     return plan
 
 def tcp_probe(host, port, timeout=3):
@@ -1702,13 +2045,13 @@ def iter_ubuntu_package_indexes(ubuntu_release, arch):
     if not codename:
         return
     archive_base = ensure_ubuntu_repo_root(
-        os.environ.get('PWN_UBUNTU_ARCHIVE_URL', 'http://archive.ubuntu.com')
+        os.environ.get('PWN_UBUNTU_ARCHIVE_URL', 'https://archive.ubuntu.com')
     )
     security_base = ensure_ubuntu_repo_root(
-        os.environ.get('PWN_UBUNTU_SECURITY_URL', 'http://security.ubuntu.com')
+        os.environ.get('PWN_UBUNTU_SECURITY_URL', 'https://security.ubuntu.com')
     )
     old_releases_base = ensure_ubuntu_repo_root(
-        os.environ.get('PWN_UBUNTU_OLD_RELEASES_URL', 'http://old-releases.ubuntu.com')
+        os.environ.get('PWN_UBUNTU_OLD_RELEASES_URL', 'https://old-releases.ubuntu.com')
     )
     pocket_roots = [
         (f'{codename}-updates', archive_base),
@@ -1791,7 +2134,7 @@ def iter_ubuntu_debug_package_indexes(ubuntu_release, arch):
     if not codename:
         return
     ddebs_base = ensure_debian_repo_root(
-        os.environ.get('PWN_UBUNTU_DDEBS_URL', 'http://ddebs.ubuntu.com')
+        os.environ.get('PWN_UBUNTU_DDEBS_URL', 'https://ddebs.ubuntu.com')
     )
     pockets = [
         codename,
@@ -1874,6 +2217,31 @@ def iter_debian_control_entries(text):
     if entry:
         yield entry
 
+def package_metadata_from_control_entry(entry, repo_root, distro=None, release=None):
+    filename = str(entry.get('Filename') or '').strip()
+    if not filename:
+        return {}
+    package_url = normalize_repository_package_url(
+        f"{str(repo_root or '').rstrip('/')}/{filename.lstrip('/')}"
+    )
+    metadata = {
+        'package_url': package_url,
+        'package_name': entry.get('Package'),
+        'package_version': entry.get('Version'),
+        'package_filename': os.path.basename(filename),
+        'package_arch': entry.get('Architecture'),
+        'package_sha256': (entry.get('SHA256') or '').strip().lower() or None,
+        'package_size': None,
+        'package_distro': distro,
+        'package_release': release,
+    }
+    try:
+        if entry.get('Size') is not None:
+            metadata['package_size'] = int(str(entry['Size']).strip())
+    except (TypeError, ValueError):
+        metadata['package_size'] = None
+    return {key: value for key, value in metadata.items() if value is not None}
+
 def decode_debian_package_index(raw_data, index_url):
     if index_url.endswith('.gz'):
         return gzip.decompress(raw_data).decode(errors='ignore')
@@ -1913,10 +2281,42 @@ def iter_deb_package_urls(package_names, distro, release, arch, package_version=
         ]
         core_output = run_rust_core(core_args, index_text, timeout=10)
         if core_output is not None:
-            for package_url in core_output.splitlines():
-                package_url = package_url.strip()
+            for output_line in core_output.splitlines():
+                output_line = output_line.strip()
+                if not output_line:
+                    continue
+                metadata = {}
+                try:
+                    parsed_output = json.loads(output_line)
+                except json.JSONDecodeError:
+                    parsed_output = None
+                if isinstance(parsed_output, dict):
+                    metadata = parsed_output
+                    package_url = metadata.get('package_url')
+                else:
+                    package_url = output_line
+                package_url = normalize_repository_package_url(package_url)
                 if not package_url or package_url in seen_urls:
                     continue
+                metadata.update(
+                    package_metadata_from_control_entry(
+                        {
+                            'Filename': metadata.get('package_filename') or os.path.basename(package_url),
+                            'Package': metadata.get('package_name'),
+                            'Version': metadata.get('package_version'),
+                            'Architecture': metadata.get('package_arch'),
+                            'SHA256': metadata.get('package_sha256'),
+                            'Size': metadata.get('package_size'),
+                        },
+                        package_url.rsplit('/', 1)[0],
+                        distro=distro,
+                        release=release,
+                    )
+                )
+                metadata['package_url'] = package_url
+                metadata.setdefault('package_distro', distro)
+                metadata.setdefault('package_release', release)
+                remember_package_metadata(package_url, metadata)
                 seen_urls.add(package_url)
                 yield package_url
             continue
@@ -1940,9 +2340,16 @@ def iter_deb_package_urls(package_names, distro, release, arch, package_version=
             entries.append((package_order.get(package_name, len(package_order)), arch_score, entry))
         for _package_rank, _arch_score, entry in sorted(entries, key=lambda item: item[:2]):
             filename = entry.get('Filename')
-            package_url = f"{repo_root}/{filename.lstrip('/')}"
+            metadata = package_metadata_from_control_entry(
+                entry,
+                repo_root,
+                distro=distro,
+                release=release,
+            )
+            package_url = metadata.get('package_url')
             if package_url in seen_urls:
                 continue
+            remember_package_metadata(package_url, metadata)
             seen_urls.add(package_url)
             yield package_url
 
@@ -1997,7 +2404,19 @@ def find_deb_debug_package_url(package_names, distro, release, arch, package_ver
             basename = os.path.basename(filename)
             if package_filename and basename != package_filename:
                 continue
-            return f"{repo_root}/{filename.lstrip('/')}"
+            package_url = normalize_repository_package_url(
+                f"{repo_root}/{filename.lstrip('/')}"
+            )
+            remember_package_metadata(
+                package_url,
+                package_metadata_from_control_entry(
+                    entry,
+                    repo_root,
+                    distro=distro,
+                    release=release,
+                ),
+            )
+            return package_url
     return None
 
 def find_ubuntu_package_url(package_names, ubuntu_release, arch, package_version=None, package_filename=None):
@@ -2175,7 +2594,7 @@ def find_local_libc_database_url(libc_path):
         return None
     if not package_url:
         return None
-    return re.sub(r'(?<!:)//+', '/', package_url)
+    return normalize_repository_package_url(package_url)
 
 def distro_from_package_version(package_version):
     text_value = str(package_version or '').lower()
@@ -2205,8 +2624,57 @@ def release_from_package_version(package_version):
     return None
 
 def normalize_repository_package_url(package_url):
-    normalized = re.sub(r'(?<!:)//+', '/', str(package_url or '').strip())
-    return normalized or None
+    text_value = str(package_url or '').strip()
+    if not text_value:
+        return None
+    parsed = urlsplit(text_value)
+    if parsed.scheme and parsed.netloc:
+        path = re.sub(r'/+', '/', parsed.path)
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+    return re.sub(r'/+', '/', text_value)
+
+def normalize_package_metadata(metadata=None, package_url=None):
+    normalized = dict(metadata or {})
+    normalized_url = normalize_repository_package_url(
+        package_url or normalized.get('package_url')
+    )
+    if normalized_url:
+        normalized['package_url'] = normalized_url
+    if normalized.get('package_sha256'):
+        normalized['package_sha256'] = str(normalized['package_sha256']).strip().lower()
+    try:
+        if normalized.get('package_size') is not None:
+            normalized['package_size'] = int(normalized['package_size'])
+    except (TypeError, ValueError):
+        normalized.pop('package_size', None)
+    if normalized.get('package_filename'):
+        normalized['package_filename'] = os.path.basename(
+            str(normalized['package_filename']).strip()
+        )
+    return normalized
+
+def remember_package_metadata(package_url, metadata=None):
+    normalized = normalize_package_metadata(metadata, package_url=package_url)
+    normalized_url = normalized.get('package_url')
+    if not normalized_url:
+        return normalized
+    current = dict(PACKAGE_METADATA_CACHE.get(normalized_url) or {})
+    current.update({key: value for key, value in normalized.items() if value is not None})
+    PACKAGE_METADATA_CACHE[normalized_url] = current
+    return current
+
+def package_metadata_for_url(package_url, metadata=None):
+    normalized_url = normalize_repository_package_url(package_url)
+    cached = dict(PACKAGE_METADATA_CACHE.get(normalized_url) or {})
+    if metadata:
+        cached.update(normalize_package_metadata(metadata, package_url=normalized_url))
+    if normalized_url:
+        cached.setdefault('package_url', normalized_url)
+        parsed = parse_deb_package_filename(normalized_url) or {}
+        cached.setdefault('package_version', parsed.get('version'))
+        cached.setdefault('package_filename', os.path.basename(normalized_url))
+        cached.setdefault('package_arch', parsed.get('arch'))
+    return cached
 
 def build_repository_metadata_from_package_url(package_url, package_version=None, arch=None):
     package_url = normalize_repository_package_url(package_url)
@@ -2226,6 +2694,33 @@ def build_repository_metadata_from_package_url(package_url, package_version=None
         'package_release': release,
     }
     return metadata
+
+def enrich_index_entry_metadata(entry):
+    enriched = dict(entry or {})
+    package_url = normalize_repository_package_url(enriched.get('package_url'))
+    if not package_url:
+        return enriched
+    package_meta = build_repository_metadata_from_package_url(
+        package_url,
+        package_version=enriched.get('package_version'),
+        arch=enriched.get('package_arch') or enriched.get('arch'),
+    )
+    for key, value in package_meta.items():
+        if value is not None:
+            enriched.setdefault(key, value)
+    enriched['package_url'] = package_url
+    remember_package_metadata(package_url, enriched)
+    return enriched
+
+def enrich_index_cache_metadata(index):
+    if not isinstance(index, dict):
+        return index
+    enriched = dict(index)
+    enriched['entries'] = [
+        enrich_index_entry_metadata(entry)
+        for entry in index.get('entries', [])
+    ]
+    return enriched
 
 def elf_has_dynamic_section(elf_path):
     fast_info = inspect_elf_fast(elf_path)
@@ -2325,6 +2820,9 @@ def copy_runtime_libc(libc_path, target_dir, overwrite=False):
     return copied
 
 def safe_member_target_path(dest_root, member_name):
+    member_name = str(member_name or '')
+    if os.path.isabs(member_name):
+        raise ValueError(f"archive path is absolute: {member_name}")
     member_path = os.path.abspath(os.path.join(dest_root, member_name))
     if not member_path.startswith(dest_root + os.sep) and member_path != dest_root:
         raise ValueError(f"archive path escapes target dir: {member_name}")
@@ -2353,20 +2851,24 @@ def sanitize_tar_link_member(member, dest_root):
 
 def safe_extract_tar(tar_obj, dest_dir):
     dest_root = os.path.abspath(dest_dir)
+    os.makedirs(dest_root, exist_ok=True)
     members = []
     for member in tar_obj.getmembers():
+        if member.isdev() or member.isfifo():
+            raise ValueError(f"archive contains unsupported special file: {member.name}")
         safe_member_target_path(dest_root, member.name)
         members.append(sanitize_tar_link_member(member, dest_root))
     try:
+        # All member and link targets are checked above.  Keep extraction in a
+        # tool-owned directory so a package cannot write outside the cache.
         tar_obj.extractall(dest_dir, members=members, filter='fully_trusted')
     except TypeError:
         tar_obj.extractall(dest_dir, members=members)
 
 def extract_all_from_deb_with_system_tools(cache_dir, package_filename, package_data):
     ar_path = shutil.which('ar')
-    bsdtar_path = shutil.which('bsdtar')
-    if not ar_path and not bsdtar_path:
-        raise RuntimeError("missing unix_ar and no system ar/bsdtar available")
+    if not ar_path:
+        raise RuntimeError("missing unix_ar and system ar; install unix_ar or binutils")
 
     package_tmp = None
     unpack_dir = None
@@ -2401,19 +2903,28 @@ def extract_all_from_deb_with_system_tools(cache_dir, package_filename, package_
                 detail = (result.stderr or result.stdout or '').strip()
                 raise RuntimeError(f"ar extract failed: {detail}")
             tar_path = os.path.join(unpack_dir, data_name)
-            with tarfile.open(tar_path, mode='r:*') as tar_obj:
-                safe_extract_tar(tar_obj, cache_dir)
+            from io import BytesIO
+            tar_stream = open(tar_path, 'rb')
+            try:
+                if data_name.endswith(('.zst', '.zstd')):
+                    try:
+                        import zstandard
+                    except ImportError as exc:
+                        raise RuntimeError(
+                            "data.tar.zst requires the Python zstandard package"
+                        ) from exc
+                    decompressed = BytesIO()
+                    zstandard.ZstdDecompressor().copy_stream(tar_stream, decompressed)
+                    tar_stream.close()
+                    decompressed.seek(0)
+                    tar_stream = decompressed
+                with tarfile.open(fileobj=tar_stream, mode='r:*') as tar_obj:
+                    safe_extract_tar(tar_obj, cache_dir)
+            finally:
+                tar_stream.close()
             return
 
-        result = subprocess.run(
-            [bsdtar_path, '-xf', package_tmp, '-C', cache_dir],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or '').strip()
-            raise RuntimeError(f"bsdtar extract failed: {detail}")
+        raise RuntimeError("failed to extract deb: system ar did not produce data.tar")
     finally:
         if unpack_dir:
             shutil.rmtree(unpack_dir, ignore_errors=True)
@@ -2453,17 +2964,73 @@ def extract_all_from_deb(cache_dir, package_filename, package_data):
         ar_file.close()
 
 def download_and_extract_deb_package(package_url, cache_key):
+    package_url = normalize_repository_package_url(package_url)
+    if not package_url:
+        return None
     cache_root = os.path.join(ensure_pwntools_cache_dir(), 'libc_tool_extra_libs')
     cache_dir = os.path.join(cache_root, cache_key)
-    if os.path.isdir(cache_dir) and any(os.scandir(cache_dir)):
-        return cache_dir
+    metadata = package_metadata_for_url(package_url)
+    marker_path = os.path.join(cache_dir, PACKAGE_CACHE_MARKER)
+    if os.path.isdir(cache_dir) and os.path.isfile(marker_path):
+        try:
+            with open(marker_path, 'r', encoding='utf-8') as marker_file:
+                marker = json.load(marker_file)
+            expected_sha256 = metadata.get('package_sha256')
+            expected_size = metadata.get('package_size')
+            marker_matches = (
+                marker.get('package_url') == package_url
+                and (not expected_sha256 or marker.get('package_sha256') == expected_sha256)
+                and (expected_size is None or marker.get('package_size') == expected_size)
+                and int(marker.get('extracted_files', 0)) > 0
+            )
+            if marker_matches:
+                return cache_dir
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
     shutil.rmtree(cache_dir, ignore_errors=True)
     os.makedirs(cache_dir, exist_ok=True)
     try:
         package_data = libcdb.wget(package_url, timeout=20)
         if not package_data:
             return None
-        extract_all_from_deb(cache_dir, os.path.basename(package_url), package_data)
+        package_size = len(package_data)
+        expected_size = metadata.get('package_size')
+        if expected_size is not None and package_size != expected_size:
+            raise ValueError(
+                f"package size mismatch: expected {expected_size}, got {package_size}"
+            )
+        package_sha256 = hashlib.sha256(package_data).hexdigest()
+        expected_sha256 = metadata.get('package_sha256')
+        if expected_sha256 and package_sha256 != expected_sha256:
+            raise ValueError(
+                f"package SHA256 mismatch: expected {expected_sha256}, got {package_sha256}"
+            )
+        if not expected_sha256 or expected_size is None:
+            log.warning(
+                f"包索引未提供完整性元数据，将仅按下载内容校验: {stderr_path(package_url)}"
+            )
+        package_filename = metadata.get('package_filename') or os.path.basename(
+            urlsplit(package_url).path
+        )
+        extract_all_from_deb(cache_dir, package_filename, package_data)
+        extracted_files = sum(
+            1 for root, _dirs, files in os.walk(cache_dir)
+            for file_name in files
+            if file_name != PACKAGE_CACHE_MARKER
+        )
+        if extracted_files <= 0:
+            raise ValueError("package extraction produced no files")
+        marker = {
+            'schema_version': 1,
+            'package_url': package_url,
+            'package_size': package_size,
+            'package_sha256': package_sha256,
+            'extracted_files': extracted_files,
+        }
+        marker_tmp = marker_path + '.tmp'
+        with open(marker_tmp, 'w', encoding='utf-8') as marker_file:
+            json.dump(marker, marker_file, sort_keys=True)
+        os.replace(marker_tmp, marker_path)
     except Exception as e:
         shutil.rmtree(cache_dir, ignore_errors=True)
         log.warning(f"下载或解压额外依赖失败: {package_url} ({e})")
@@ -2766,6 +3333,7 @@ def download_candidate_libc_package(candidate):
     package_url = normalize_repository_package_url(candidate.get('package_url'))
     if not package_url:
         return None
+    remember_package_metadata(package_url, candidate)
     cache_key = hashlib.sha256(f'candidate:{package_url}'.encode()).hexdigest()[:16]
     distro = candidate.get('package_distro')
     release = candidate.get('package_release')
@@ -3112,17 +3680,18 @@ def load_index_cache():
     if os.path.exists(LIBC_INDEX_CACHE):
         try:
             with open(LIBC_INDEX_CACHE, 'r') as f:
-                return json.load(f)
+                return enrich_index_cache_metadata(json.load(f))
         except Exception as e:
             log.warning(f"读取索引缓存失败: {e}")
     return None
 
-def cache_source_mtime(db_path=LIBC_DB_PATH):
+def cache_source_mtime(db_path=None):
+    db_path = db_path or LIBC_DB_PATH
     return max(
         (
             os.path.getmtime(os.path.join(db_path, name))
             for name in os.listdir(db_path)
-            if name.endswith(('.so', '.symbols', '.info'))
+            if name.endswith(('.so', '.symbols', '.info', '.url'))
         ),
         default=0
     )
@@ -3143,9 +3712,16 @@ def index_cache_is_compatible(index):
         'versions_sorted',
         'entries',
     }
-    return index.get('schema_version') == CACHE_SCHEMA_VERSION and required_keys.issubset(index)
+    if index.get('schema_version') != CACHE_SCHEMA_VERSION or not required_keys.issubset(index):
+        return False
+    entries = index.get('entries')
+    if not isinstance(entries, list):
+        return False
+    return all(isinstance(entry, dict) and 'package_url' in entry for entry in entries)
 
-def index_cache_is_fresh(cache_path=LIBC_INDEX_CACHE, db_path=LIBC_DB_PATH):
+def index_cache_is_fresh(cache_path=None, db_path=None):
+    cache_path = cache_path or LIBC_INDEX_CACHE
+    db_path = db_path or LIBC_DB_PATH
     if not os.path.exists(cache_path):
         return False
     return cache_source_mtime(db_path) <= os.path.getmtime(cache_path)
@@ -3300,7 +3876,9 @@ def index_build_worker_count(total):
     cpu_count = os.cpu_count() or 4
     return max(1, min(total, INDEX_BUILD_MAX_WORKERS, cpu_count))
 
-def build_index_cache_with_rust(db_path=LIBC_DB_PATH, cache_path=LIBC_INDEX_CACHE, emit=None):
+def build_index_cache_with_rust(db_path=None, cache_path=None, emit=None):
+    db_path = db_path or LIBC_DB_PATH
+    cache_path = cache_path or LIBC_INDEX_CACHE
     if emit is None:
         emit = print
     core_path = find_rust_core_binary()
@@ -3327,6 +3905,7 @@ def build_index_cache_with_rust(db_path=LIBC_DB_PATH, cache_path=LIBC_INDEX_CACH
     except json.JSONDecodeError as e:
         log.warning(f"Rust core 索引 JSON 解析失败: {e}")
         return None
+    index = enrich_index_cache_metadata(index)
     if not index_cache_is_compatible(index):
         log.warning("Rust core 生成的索引不兼容，回退 Python 索引构建")
         return None
@@ -3348,7 +3927,9 @@ def build_index_cache_with_rust(db_path=LIBC_DB_PATH, cache_path=LIBC_INDEX_CACH
         log.warning(f"索引缓存写入失败，将使用内存索引继续: {e}")
     return index
 
-def build_index_cache(db_path=LIBC_DB_PATH, cache_path=LIBC_INDEX_CACHE, emit=None):
+def build_index_cache(db_path=None, cache_path=None, emit=None):
+    db_path = db_path or LIBC_DB_PATH
+    cache_path = cache_path or LIBC_INDEX_CACHE
     if emit is None:
         emit = print
 
@@ -3490,6 +4071,7 @@ def attach_entry_metadata_to_match(match, entry):
     enriched = dict(match)
     if not entry:
         return enriched
+    entry = enrich_index_entry_metadata(entry)
     for key in (
         'id',
         'package_url',
@@ -3501,6 +4083,8 @@ def attach_entry_metadata_to_match(match, entry):
     ):
         if entry.get(key) is not None:
             enriched[key] = entry.get(key)
+    if enriched.get('package_url'):
+        remember_package_metadata(enriched['package_url'], enriched)
     return enriched
 
 def symbol_count(entry):
@@ -5079,6 +5663,12 @@ def log_patch_completion(target_elf, plan, verbose=True):
         f"Patch 完成: {stderr_path(target_elf)} "
         f"(mode={stderr_choice(plan['mode'])}, loader={stderr_path(plan['loader_path'])})"
     )
+    if plan.get('in_place_runtime'):
+        log.warning('运行库以原地模式修改，restore 时会按 manifest 回滚共享库')
+    elif plan.get('isolated_runtime_dir'):
+        log.info(f"隔离运行库: {stderr_path(plan['isolated_runtime_dir'])}")
+    if plan.get('manifest_path'):
+        log.info(f"Patch manifest: {stderr_path(plan['manifest_path'])}")
     if not verbose:
         return
     log.info(
@@ -5116,6 +5706,43 @@ def resolve_docker_template(template_name):
     if not os.path.isdir(deploy_dir):
         raise RuntimeError(f"Docker 模板不存在: {deploy_dir}")
     return deploy_dir
+
+def docker_template_profile(template_name):
+    deploy_dir = resolve_docker_template(template_name)
+    name = str(template_name or '').strip()
+    lowered = name.lower()
+    if 'xinetd' in lowered:
+        launcher = 'xinetd'
+    elif 'ynetd' in lowered:
+        launcher = 'ynetd'
+    elif 'nsjail' in lowered:
+        launcher = 'nsjail'
+    elif lowered == 'red.pwn.jail':
+        launcher = 'red-jail'
+    else:
+        launcher = 'socat'
+    profile = {
+        'name': name,
+        'deploy_dir': deploy_dir,
+        'launcher': launcher,
+        'base_family': 'alpine' if lowered.startswith('alpine+') else 'debian',
+        'chroot': '+chroot' in lowered,
+        'privileged': launcher == 'nsjail',
+        'assets': {},
+    }
+    for asset_name in ('ctf.xinetd', 'nsjail.cfg', 'start.sh'):
+        asset_path = os.path.join(deploy_dir, asset_name)
+        if os.path.isfile(asset_path):
+            profile['assets'][asset_name] = asset_path
+    for binary_name in ('xinetd', 'ynetd'):
+        asset_path = os.path.join(deploy_dir, 'bin', binary_name)
+        if os.path.isfile(asset_path):
+            profile['assets'][binary_name] = asset_path
+    if launcher == 'ynetd' and 'ynetd' not in profile['assets']:
+        raise RuntimeError(f"模板缺少 ynetd 运行文件: {os.path.join(deploy_dir, 'bin', 'ynetd')}")
+    if launcher == 'nsjail' and 'nsjail.cfg' not in profile['assets']:
+        raise RuntimeError(f"模板缺少 nsjail.cfg: {deploy_dir}")
+    return profile
 
 def default_docker_deploy_dir(elf_path):
     elf_dir = os.path.dirname(os.path.abspath(elf_path))
@@ -5854,7 +6481,95 @@ export LIBC_TOOL_DEPLOY_DIR="$script_dir"
 exec gdb -q -x "$script_dir/debug.gdb" "$@"
 """
 
-def render_dockerfile(base_image, template_name, enable_gdbserver=False):
+def render_dockerfile(base_image, template_name, enable_gdbserver=False, template_profile=None):
+    template_profile = template_profile or docker_template_profile(template_name)
+    launcher = template_profile.get('launcher', 'socat')
+    if launcher != 'socat':
+        header = f"# generated by libc_tool docker, based on {template_name}\n"
+        alpine = base_image.startswith('alpine:')
+        if launcher == 'nsjail':
+            return header + f"""FROM {base_image}
+
+USER root
+
+COPY ./flag /chroot/home/ctf/flag
+COPY ./run_pwn.sh /run_pwn.sh
+COPY ./nsjail.cfg /nsjail.cfg
+COPY ./start.sh /start.sh
+
+RUN chmod 644 /chroot/home/ctf/flag && \\
+    chmod 755 /run_pwn.sh /start.sh
+
+EXPOSE 1337
+
+CMD [\"/start.sh\"]
+"""
+        if launcher == 'red-jail':
+            return header + f"""FROM {base_image}
+
+COPY ./bundle/challenge /srv/app
+COPY ./flag /srv/app/flag
+COPY ./run_pwn.sh /srv/app/run_pwn.sh
+
+RUN chmod 755 /srv/app/run_pwn.sh
+"""
+        packages = ['bash', 'coreutils']
+        if alpine:
+            packages.append('shadow')
+        else:
+            packages.append('util-linux')
+        if launcher == 'xinetd':
+            packages.append('xinetd')
+        if enable_gdbserver:
+            packages.append('gdbserver')
+        package_text = ' '.join(packages)
+        if alpine:
+            install = (
+                f"RUN apk add --no-cache {package_text} && \\\n"
+                "    if ! id -u ctf >/dev/null 2>&1; then adduser -D -s /bin/sh ctf; fi"
+            )
+        else:
+            install = (
+                f"RUN apt-get update && \\\n"
+                f"    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {package_text} && \\\n"
+                "    rm -rf /var/lib/apt/lists/* && \\\n"
+                "    if ! id -u ctf >/dev/null 2>&1; then useradd -m -s /bin/sh ctf; fi"
+            )
+        asset_lines = []
+        if launcher == 'xinetd':
+            asset_lines.append('COPY ./ctf.xinetd /etc/ctf.xinetd')
+            if 'xinetd' in template_profile.get('assets', {}):
+                asset_lines.append('COPY ./bin/xinetd /usr/sbin/xinetd')
+        elif launcher == 'ynetd':
+            asset_lines.append('COPY ./bin/ynetd /usr/local/bin/ynetd')
+        asset_text = '\n'.join(asset_lines)
+        if launcher == 'xinetd':
+            command = 'xinetd -f /etc/ctf.xinetd -pidfile /run/xinetd.pid -limit 1000 -reuse; sleep infinity'
+        else:
+            command = '/usr/local/bin/ynetd -p 1337 -lp 500 -se y /run_pwn.sh'
+        return header + f"""FROM {base_image}
+
+USER root
+
+{install}
+
+WORKDIR /home/ctf
+
+COPY ./flag ./flag
+COPY ./run_pwn.sh /
+COPY ./run_challenge.sh /
+COPY ./prepare_gdb_target.sh /
+{asset_text}
+
+RUN chmod 644 ./flag && \\
+    chmod 755 /run_pwn.sh /run_challenge.sh /prepare_gdb_target.sh && \\
+    chmod 755 /usr/sbin/xinetd /usr/local/bin/ynetd 2>/dev/null || true && \\
+    chown -R root:root .
+
+EXPOSE 1337
+
+CMD {command}
+"""
     header = f"# generated by libc_tool docker, based on {template_name}\n"
     alpine_packages = "socat bash util-linux coreutils shadow"
     debian_packages = "socat bash util-linux coreutils"
@@ -5957,6 +6672,8 @@ def render_docker_compose(config):
         f"      - {yaml_quote(challenge_mount + ':' + config['challenge_root'])}",
         f"      - {yaml_quote(runtime_mount + ':' + config['runtime_root'])}",
     ])
+    if config.get('privileged'):
+        lines.insert(lines.index("    environment:"), "    privileged: true")
     if config['enable_gdbserver']:
         lines.insert(lines.index("    volumes:"), f"      - {yaml_quote(str(config['gdb_port']) + ':' + str(config['gdb_port']))}")
     lines.append("")
@@ -6073,6 +6790,57 @@ def copy_portable_tree(source_dir, target_dir, exclude_paths=None):
     os.makedirs(os.path.dirname(target_dir), exist_ok=True)
     shutil.copytree(source_dir, target_dir, ignore=ignore)
 
+def copy_docker_template_assets(deploy_dir, template_profile):
+    assets = template_profile.get('assets', {})
+    launcher = template_profile.get('launcher')
+    if launcher == 'xinetd':
+        target_config = os.path.join(deploy_dir, 'ctf.xinetd')
+        source_config = assets.get('ctf.xinetd')
+        if source_config:
+            shutil.copy2(source_config, target_config)
+        else:
+            write_generated_file(
+                target_config,
+                """service ctf
+{
+    disable = no
+    socket_type = stream
+    protocol = tcp
+    wait = no
+    user = root
+    type = UNLISTED
+    port = 1337
+    bind = 0.0.0.0
+    server = /bin/bash
+    server_args = /run_pwn.sh
+}
+""",
+            )
+    for binary_name in ('xinetd', 'ynetd'):
+        source_binary = assets.get(binary_name)
+        if not source_binary:
+            continue
+        target_binary = os.path.join(deploy_dir, 'bin', binary_name)
+        os.makedirs(os.path.dirname(target_binary), exist_ok=True)
+        shutil.copy2(source_binary, target_binary)
+        os.chmod(target_binary, 0o755)
+    if launcher == 'nsjail':
+        source_cfg = assets.get('nsjail.cfg')
+        if source_cfg:
+            shutil.copy2(source_cfg, os.path.join(deploy_dir, 'nsjail.cfg'))
+        write_generated_file(
+            os.path.join(deploy_dir, 'start.sh'),
+            """#!/bin/sh
+set -eu
+
+if command -v kctf_setup >/dev/null 2>&1; then
+    kctf_setup
+fi
+exec socat TCP-LISTEN:1337,reuseaddr,fork EXEC:\"nsjail --config /nsjail.cfg -- /run_pwn.sh\"
+""",
+            executable=True,
+        )
+
 def generate_docker_bundle(
     elf_path,
     runtime_dir,
@@ -6088,7 +6856,7 @@ def generate_docker_bundle(
     enable_gdbserver,
     gdb_port,
 ):
-    resolve_docker_template(template_name)
+    template_profile = docker_template_profile(template_name)
     runtime_probe = ensure_runtime_dir_ready_for_execution(elf_path, runtime_dir)
     challenge_dir = os.path.abspath(challenge_dir)
     elf_path = os.path.abspath(elf_path)
@@ -6142,6 +6910,8 @@ def generate_docker_bundle(
         'runtime_overlay_path': runtime_overlay_path,
         'library_path_env': f'{runtime_overlay_path}:{challenge_root}',
         'template_name': template_name,
+        'template_profile': template_profile.get('launcher'),
+        'privileged': template_profile.get('privileged', False),
         'base_image': base_image,
         'bundle_name': os.path.basename(os.path.normpath(deploy_dir)) or container_name,
     }
@@ -6153,9 +6923,15 @@ def generate_docker_bundle(
         exclude_paths=[deploy_dir],
     )
     copy_portable_tree(runtime_dir, bundle_runtime_host)
+    copy_docker_template_assets(deploy_dir, template_profile)
     write_generated_file(
         os.path.join(deploy_dir, 'Dockerfile'),
-        render_dockerfile(base_image, template_name, enable_gdbserver=enable_gdbserver),
+        render_dockerfile(
+            base_image,
+            template_name,
+            enable_gdbserver=enable_gdbserver,
+            template_profile=template_profile,
+        ),
     )
     write_generated_file(
         os.path.join(deploy_dir, 'docker-compose.yaml'),
@@ -6217,6 +6993,7 @@ def generate_docker_bundle(
         'gdb_script_path': gdb_script_path,
         'gdb_wrapper_path': gdb_wrapper_path,
         'runtime_probe': runtime_probe,
+        'template_profile': template_profile.get('launcher'),
     }
 
 def run_docker_compose_action(deploy_dir, compose_args):
@@ -6337,11 +7114,23 @@ def run_docker_command(args, parser):
         )
     challenge_dir = os.path.abspath(args.challenge_dir) if args.challenge_dir else os.path.dirname(target_elf)
     template_name = args.template
+    try:
+        template_profile = docker_template_profile(template_name)
+    except RuntimeError as e:
+        log.failure(str(e))
+        sys.exit(1)
     base_image = docker_base_image_for_runtime(
         runtime_dir,
         libc_candidate=libc_candidate,
         override=args.base_image,
     )
+    if not args.base_image:
+        if template_profile.get('launcher') == 'nsjail':
+            base_image = 'anjia0532/kctf-docker.challenge:latest'
+        elif template_profile.get('launcher') == 'red-jail':
+            base_image = 'pwn.red/jail'
+        elif template_profile.get('base_family') == 'alpine':
+            base_image = 'alpine:latest'
     selected_host_port, selected_gdb_port = resolve_docker_host_ports(
         args.port,
         enable_gdbserver=args.gdbserver,
@@ -6608,6 +7397,7 @@ def run_patch_command(args, parser):
                     mode=args.patch_mode,
                     verify=not args.no_verify,
                     extra_needed=extra_needed,
+                    in_place_runtime=args.in_place_runtime,
                 )
         except RuntimeError as e:
             log.failure(str(e))
@@ -6638,6 +7428,7 @@ def run_patch_command(args, parser):
                         mode=args.patch_mode,
                         verify=not args.no_verify,
                         extra_needed=extra_needed,
+                        in_place_runtime=args.in_place_runtime,
                     )
             except RuntimeError as e:
                 log.failure(str(e))
@@ -6682,6 +7473,7 @@ def run_patch_command(args, parser):
                 mode=args.patch_mode,
                 verify=not args.no_verify,
                 extra_needed=extra_needed,
+                in_place_runtime=args.in_place_runtime,
             )
     except RuntimeError as e:
         log.failure(str(e))
@@ -6710,6 +7502,11 @@ def add_candidate_args(parser):
 def add_patch_behavior_args(parser):
     parser.add_argument('--patch-mode', choices=('rpath', 'replace-needed'), default='rpath', help='patch 模式，默认 rpath')
     parser.add_argument('--no-verify', action='store_true', help='patch 后不执行 loader --list 验证')
+    parser.add_argument(
+        '--in-place-runtime',
+        action='store_true',
+        help='显式允许直接修改 --dir/--libc 同目录中的共享库；默认使用隔离运行库副本',
+    )
 
 def supported_cli_commands():
     return [

@@ -36,12 +36,16 @@ runtime_dir="$workdir/libc_dir"
 plain_dir="$workdir/deploy_plain"
 quiet_dir="$workdir/deploy_quiet"
 gdb_dir="$workdir/deploy_gdb"
+xinetd_dir="$workdir/deploy_xinetd"
+ynetd_dir="$workdir/deploy_ynetd"
 binary_path="$challenge_dir/pwn"
 quiet_log="$workdir/docker_quiet.log"
 plain_port=43001
 quiet_port=43011
 gdb_service_port=43021
 gdb_debug_port=43137
+xinetd_port=43031
+ynetd_port=43041
 
 mkdir -p "$challenge_dir" "$runtime_dir"
 
@@ -210,8 +214,36 @@ if rg -n -- '--library-path|ld-linux' "$gdb_dir/run_challenge.sh" >/dev/null; th
     exit 1
 fi
 
+python3 "$repo_root/libc_tool.py" docker \
+    --dir "$runtime_dir" \
+    --deploy-dir "$xinetd_dir" \
+    --template ubuntu+xinetd+chroot \
+    --port "$xinetd_port" \
+    --generate-only \
+    "$binary_path"
+
+[[ -f "$xinetd_dir/Dockerfile" ]]
+[[ -f "$xinetd_dir/ctf.xinetd" ]]
+rg -n 'CMD xinetd -f /etc/ctf\.xinetd' "$xinetd_dir/Dockerfile" >/dev/null
+rg -n 'COPY ./ctf\.xinetd /etc/ctf\.xinetd' "$xinetd_dir/Dockerfile" >/dev/null
+
+python3 "$repo_root/libc_tool.py" docker \
+    --dir "$runtime_dir" \
+    --deploy-dir "$ynetd_dir" \
+    --template alpine+ynetd+chroot+patchelf2 \
+    --port "$ynetd_port" \
+    --generate-only \
+    "$binary_path"
+
+[[ -f "$ynetd_dir/Dockerfile" ]]
+[[ -f "$ynetd_dir/bin/ynetd" ]]
+rg -n 'CMD /usr/local/bin/ynetd -p 1337' "$ynetd_dir/Dockerfile" >/dev/null
+rg -n 'COPY ./bin/ynetd /usr/local/bin/ynetd' "$ynetd_dir/Dockerfile" >/dev/null
+
 printf 'smoke ok\n'
 printf 'binary: %s\n' "$binary_path"
 printf 'runtime: %s\n' "$runtime_dir"
 printf 'plain deploy: %s\n' "$plain_dir"
 printf 'gdb deploy: %s\n' "$gdb_dir"
+printf 'xinetd deploy: %s\n' "$xinetd_dir"
+printf 'ynetd deploy: %s\n' "$ynetd_dir"

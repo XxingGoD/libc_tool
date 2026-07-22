@@ -6,7 +6,3 @@ edition = "2021"
 [[bin]]
 name = "libc_tool_core"
 path = "rust/libc_tool_core.rs"
-
-[[bin]]
-name = "wizard_demo"
-path = "rust/wizard_demo.rs"
