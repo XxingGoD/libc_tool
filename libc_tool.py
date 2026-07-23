@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import posixpath
 import re
 import json
 import gzip
@@ -6471,7 +6472,13 @@ fi
 {command}
 """
 
-def render_docker_gdb_prepare_script(runtime_root, elf_container_path, exec_target_path):
+def render_docker_gdb_prepare_script(
+    runtime_root,
+    elf_container_path,
+    exec_target_path,
+    interpreter_path='',
+    runtime_loader_path='',
+):
     return f"""#!/bin/bash
 set -e
 
@@ -6479,12 +6486,29 @@ runtime_root={shlex.quote(runtime_root)}
 overlay_dir=${{LIBC_TOOL_RUNTIME_OVERLAY:-/tmp/libc_tool_runtime_extra}}
 elf_source={shlex.quote(elf_container_path)}
 exec_target={shlex.quote(exec_target_path)}
+interpreter_path={shlex.quote(interpreter_path)}
+runtime_loader_path={shlex.quote(runtime_loader_path)}
 
 mkdir -p "$overlay_dir"
 find "$overlay_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +
 
 cp -f "$elf_source" "$exec_target"
 chmod 755 "$exec_target"
+
+if [ ! -z "$interpreter_path" ] && [ ! -z "$runtime_loader_path" ]
+then
+    target_dir=$(dirname "$exec_target")
+    for base_dir in "$(pwd)" "$target_dir"
+    do
+        interpreter_link="$base_dir/$interpreter_path"
+        mkdir -p "$(dirname "$interpreter_link")"
+        if [ -e "$interpreter_link" ] || [ -L "$interpreter_link" ]
+        then
+            continue
+        fi
+        ln -s "$runtime_loader_path" "$interpreter_link"
+    done
+fi
 
 if [ ! -d "$runtime_root" ]
 then
@@ -6912,6 +6936,15 @@ def normalize_portable_relpath(path):
     text = str(path or '').strip().replace('\\', '/')
     return text.strip('/')
 
+def normalize_relative_elf_path(path, description):
+    text = str(path or '').strip().replace('\\', '/')
+    if not text or text.startswith('/'):
+        return ''
+    normalized = posixpath.normpath(text)
+    if normalized in {'', '.', '..'} or normalized.startswith('../'):
+        raise RuntimeError(f"{description}包含不安全的相对路径: {path}")
+    return normalized
+
 def docker_bundle_root_host(deploy_dir):
     return os.path.join(os.path.abspath(deploy_dir), DOCKER_BUNDLE_DIRNAME)
 
@@ -7061,6 +7094,25 @@ def generate_docker_bundle(
     challenge_root = '/challenge'
     elf_container_path = relative_container_path(challenge_dir, elf_path, challenge_root)
     exec_target_path = docker_exec_target_path(elf_container_path)
+    interpreter_path = get_program_interpreter(elf_path) or ''
+    relative_interpreter_path = normalize_relative_elf_path(
+        interpreter_path,
+        'ELF interpreter',
+    )
+    runtime_loader_path = ''
+    if relative_interpreter_path:
+        runtime_loader_host = runtime_probe.get('loader_path')
+        if not runtime_loader_host:
+            raise RuntimeError('相对 ELF interpreter 需要可用的运行库 loader')
+        try:
+            runtime_loader_rel = os.path.relpath(runtime_loader_host, runtime_dir)
+            if runtime_loader_rel == '..' or runtime_loader_rel.startswith('..' + os.sep):
+                raise ValueError
+        except ValueError as e:
+            raise RuntimeError(
+                f"运行库 loader 不在运行库目录内，无法处理相对 ELF interpreter: {runtime_loader_host}"
+            ) from e
+        runtime_loader_path = f"{runtime_root}/{normalize_portable_relpath(runtime_loader_rel)}"
     runtime_overlay_path = '/tmp/libc_tool_runtime_extra'
     command = shell_join_args(['exec', exec_target_path])
     elf_rel = os.path.relpath(elf_path, challenge_dir)
@@ -7144,6 +7196,8 @@ def generate_docker_bundle(
             runtime_root,
             elf_container_path,
             exec_target_path,
+            interpreter_path=relative_interpreter_path,
+            runtime_loader_path=runtime_loader_path,
         ),
         executable=True,
     )

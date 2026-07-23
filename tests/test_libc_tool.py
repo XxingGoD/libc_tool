@@ -189,6 +189,19 @@ class LibcToolTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             libc_tool.parse_docker_target_selection('0,9', 3)
 
+    def test_docker_prepare_script_supports_relative_elf_interpreter(self):
+        prepare_script = libc_tool.render_docker_gdb_prepare_script(
+            '/runtime',
+            '/challenge/heap',
+            '/tmp/libc_tool_exec_heap',
+            interpreter_path='libc_dir/ld-linux-x86-64.so.2',
+            runtime_loader_path='/runtime/ld-linux-x86-64.so.2',
+        )
+        self.assertIn('interpreter_path=libc_dir/ld-linux-x86-64.so.2', prepare_script)
+        self.assertIn('runtime_loader_path=/runtime/ld-linux-x86-64.so.2', prepare_script)
+        self.assertIn('interpreter_link="$base_dir/$interpreter_path"', prepare_script)
+        self.assertIn('ln -s "$runtime_loader_path" "$interpreter_link"', prepare_script)
+
     def test_docker_deploy_dir_cleanup_is_guarded(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             generated_dir = os.path.join(temp_dir, '.libc_tool_docker_pwn')

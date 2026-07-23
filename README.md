@@ -240,6 +240,8 @@ python3 libc_tool.py docker -y --gdbserver --gdb-port 1234 ./pwn
 
 无特权容器无法调用 `personality(ADDR_NO_RANDOMIZE)`，生成的 gdbserver 会显式使用 `--no-disable-randomization`，因此不会再打印 `Error disabling address space randomization`；调试时保留题目真实的 ASLR 行为。
 
+如果目标 ELF 的 `PT_INTERP` 是相对路径（例如 `libc_dir/ld-linux-x86-64.so.2`），准备脚本会在容器运行目录和复制后的目标目录建立对应的 loader 链接，避免 gdbserver 启动时出现 `env: ... No such file or directory`。
+
 注意：容器里的题目进程仍然是由服务端口触发的，所以通常要先让 `exp` 或 `nc 127.0.0.1 <port>` 连上服务端口，再执行 `./debug.sh`。
 
 如果默认宿主机端口已经被别的题目容器占用：

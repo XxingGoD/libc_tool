@@ -118,6 +118,8 @@ rg -n 'elf_source=/challenge/pwn' "$plain_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'exec_target=/tmp/libc_tool_exec_pwn' "$plain_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'cp -f "\$elf_source" "\$exec_target"' "$plain_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'chmod 755 "\$exec_target"' "$plain_dir/prepare_gdb_target.sh" >/dev/null
+rg -n 'interpreter_path=' "$plain_dir/prepare_gdb_target.sh" >/dev/null
+rg -n 'runtime_loader_path=' "$plain_dir/prepare_gdb_target.sh" >/dev/null
 rg -n "LIBC_TOOL_DEPLOY_DIR" "$plain_dir/debug.sh" >/dev/null
 rg -n 'gdb -q -x "\$script_dir/debug\.gdb"' "$plain_dir/debug.sh" >/dev/null
 rg -n "deploy_dir = os\\.path\\.realpath\\(os\\.environ\\.get\\('LIBC_TOOL_DEPLOY_DIR'\\) or os\\.getcwd\\(\\)\\)" "$plain_dir/debug.gdb" >/dev/null
@@ -200,6 +202,8 @@ rg -n 'elf_source=/challenge/pwn' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'exec_target=/tmp/libc_tool_exec_pwn' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'cp -f "\$elf_source" "\$exec_target"' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'chmod 755 "\$exec_target"' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
+rg -n 'interpreter_path=' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
+rg -n 'runtime_loader_path=' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'cp -Lf ' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n '/tmp/libc_tool_runtime_extra' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n "LIBC_TOOL_DEPLOY_DIR" "$gdb_dir/debug.sh" >/dev/null
