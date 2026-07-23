@@ -6399,6 +6399,8 @@ gdb_port=${LIBC_TOOL_GDB_PORT:-1234}
 gdb_prepare=${LIBC_TOOL_GDB_PREPARE:-}
 gdb_target=${LIBC_TOOL_GDB_TARGET:-}
 runtime_library_path=${LIBC_TOOL_LIBRARY_PATH:-}
+# Unprivileged containers cannot call personality(ADDR_NO_RANDOMIZE); keep ASLR enabled.
+gdbserver_options=(--once --no-disable-randomization)
 
 if [ ! -x "$launch_script" ]
 then
@@ -6427,14 +6429,14 @@ then
         if [ ! -z "$runtime_library_path" ]
         then
             exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" \
-                gdbserver --once --wrapper env "LD_LIBRARY_PATH=${runtime_library_path}" -- \
+                gdbserver "${gdbserver_options[@]}" --wrapper env "LD_LIBRARY_PATH=${runtime_library_path}" -- \
                 "0.0.0.0:${gdb_port}" "$gdb_target"
         fi
         exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" \
-            gdbserver --once "0.0.0.0:${gdb_port}" "$gdb_target"
+            gdbserver "${gdbserver_options[@]}" "0.0.0.0:${gdb_port}" "$gdb_target"
     fi
     exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" \
-        gdbserver --once "0.0.0.0:${gdb_port}" "$launch_script"
+        gdbserver "${gdbserver_options[@]}" "0.0.0.0:${gdb_port}" "$launch_script"
 fi
 
 exec runuser -u ctf --pty -- timeout "${TIMEOUT:-300}" "$launch_script"
@@ -6520,6 +6522,7 @@ def render_docker_gdb_script(
         "set confirm off",
         "set breakpoint pending on",
         "set auto-solib-add on",
+        "set disable-randomization off",
         "set follow-fork-mode parent",
         "# Keep command shells usable when they fork or vfork helper processes.",
         "set detach-on-fork on",

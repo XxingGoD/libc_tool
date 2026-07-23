@@ -156,7 +156,8 @@ class LibcToolTest(unittest.TestCase):
         )
 
         self.assertIn('LIBC_TOOL_LIBRARY_PATH', run_script)
-        self.assertIn('gdbserver --once --wrapper env', run_script)
+        self.assertIn('gdbserver "${gdbserver_options[@]}" --wrapper env', run_script)
+        self.assertIn('gdbserver_options=(--once --no-disable-randomization)', run_script)
         self.assertIn('export LD_LIBRARY_PATH="$runtime_library_path"', challenge_script)
         self.assertNotIn('LD_LIBRARY_PATH:', run_script)
         self.assertIn('bundle_dir = os.path.commonpath([challenge_dir, runtime_dir])', gdb_script)
@@ -164,6 +165,7 @@ class LibcToolTest(unittest.TestCase):
         self.assertNotIn("_libc_tool_gdb_quote(bundle_dir)", gdb_script)
         self.assertNotIn('.gdb_sysroot', gdb_script)
         self.assertIn('LIBC_TOOL_GDB_WAIT', gdb_script)
+        self.assertIn('set disable-randomization off', gdb_script)
         self.assertIn('set follow-fork-mode parent', gdb_script)
         self.assertIn('set detach-on-fork on', gdb_script)
         self.assertNotIn('set detach-on-fork off', gdb_script)

@@ -238,6 +238,8 @@ python3 libc_tool.py docker -y --gdbserver --gdb-port 1234 ./pwn
 
 `debug.sh` 会在短时间内重试 GDB 连接，失败的连接状态会先清理，适合服务端口和 gdbserver 端口存在启动竞态；等待时间可通过 `LIBC_TOOL_GDB_WAIT=30` 调整。生成的 GDB 脚本默认跟随父进程并自动脱离 fork/vfork 子进程，shell 执行 `cat`、`system` 等命令时不会被调试器挂住。需要专门调试子进程时，可在 GDB 中手动执行 `set detach-on-fork off` 和 `set schedule-multiple on`。socat 调试监听器保持常驻，但同时只允许一个题目客户端/调试会话，断开后可以重新连接，不会因为一次 GDB 断开而重启整个容器。
 
+无特权容器无法调用 `personality(ADDR_NO_RANDOMIZE)`，生成的 gdbserver 会显式使用 `--no-disable-randomization`，因此不会再打印 `Error disabling address space randomization`；调试时保留题目真实的 ASLR 行为。
+
 注意：容器里的题目进程仍然是由服务端口触发的，所以通常要先让 `exp` 或 `nc 127.0.0.1 <port>` 连上服务端口，再执行 `./debug.sh`。
 
 如果默认宿主机端口已经被别的题目容器占用：

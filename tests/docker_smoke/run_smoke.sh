@@ -194,7 +194,8 @@ if rg -n '^      LD_LIBRARY_PATH:' "$gdb_dir/docker-compose.yaml" >/dev/null; th
 fi
 rg -n '\./bundle/challenge:/challenge' "$gdb_dir/docker-compose.yaml" >/dev/null
 rg -n '\./bundle/runtime:/runtime' "$gdb_dir/docker-compose.yaml" >/dev/null
-rg -n 'gdbserver --once --wrapper env "LD_LIBRARY_PATH=\$\{runtime_library_path\}" --' "$gdb_dir/run_pwn.sh" >/dev/null
+rg -n 'gdbserver "\$\{gdbserver_options\[@\]\}" --wrapper env "LD_LIBRARY_PATH=\$\{runtime_library_path\}" --' "$gdb_dir/run_pwn.sh" >/dev/null
+rg -n 'gdbserver_options=\(--once --no-disable-randomization\)' "$gdb_dir/run_pwn.sh" >/dev/null
 rg -n 'elf_source=/challenge/pwn' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'exec_target=/tmp/libc_tool_exec_pwn' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
 rg -n 'cp -f "\$elf_source" "\$exec_target"' "$gdb_dir/prepare_gdb_target.sh" >/dev/null
@@ -210,6 +211,7 @@ if rg -n 'gdb_sysroot' "$gdb_dir/debug.gdb" >/dev/null; then
 fi
 rg -n "target remote 127\\.0\\.0\\.1:${gdb_debug_port}" "$gdb_dir/debug.gdb" >/dev/null
 rg -n 'LIBC_TOOL_GDB_WAIT' "$gdb_dir/debug.gdb" >/dev/null
+rg -n '^set disable-randomization off$' "$gdb_dir/debug.gdb" >/dev/null
 rg -n '^set follow-fork-mode parent$' "$gdb_dir/debug.gdb" >/dev/null
 rg -n '^set detach-on-fork on$' "$gdb_dir/debug.gdb" >/dev/null
 if rg -n '^set detach-on-fork off$' "$gdb_dir/debug.gdb" >/dev/null; then
