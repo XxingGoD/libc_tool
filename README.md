@@ -213,6 +213,14 @@ python3 libc_tool.py docker -y --generate-only ./pwn
 python3 libc_tool.py docker --dir ./libc_dir ./pwn
 ```
 
+如果目标 ELF 同目录已经有题目提供的 `libc.so.6` 和 loader，可以让 Docker 优先使用这套本地运行库：
+
+```bash
+python3 libc_tool.py docker --prefer-local -y ./pwn
+```
+
+`--prefer-local` 只会接受通过目标 ABI、loader 和依赖检查的本地运行库。未指定该选项时，自动模式仍按 ELF 信息从 libc 索引选择候选；如果发现可用的本地版本，会提示使用 `--prefer-local`。例如本地 libc 显示 `Ubuntu GLIBC 2.43`，而 ELF 推断目标环境为 `GLIBC 2.39`，两者分别表示“手头运行库版本”和“自动推断的目标环境”，不会被混为同一个候选。
+
 如果你需要容器内额外开启 `gdbserver` 远程调试端口：
 
 ```bash

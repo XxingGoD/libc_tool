@@ -202,6 +202,32 @@ class LibcToolTest(unittest.TestCase):
         self.assertIn('interpreter_link="$base_dir/$interpreter_path"', prepare_script)
         self.assertIn('ln -s "$runtime_loader_path" "$interpreter_link"', prepare_script)
 
+    def test_docker_prefer_local_parser_and_runtime_probe(self):
+        parser = libc_tool.build_cli_parser()
+        args = parser.parse_args(['docker', '--prefer-local', 'shop'])
+        self.assertTrue(args.prefer_local)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            elf_path = os.path.join(temp_dir, 'shop')
+            libc_path = os.path.join(temp_dir, 'libc.so.6')
+            with open(elf_path, 'wb') as file_obj:
+                file_obj.write(b'ELF')
+            with open(libc_path, 'wb') as file_obj:
+                file_obj.write(b'ELF')
+            probe = {
+                'ok': True,
+                'target_dir': temp_dir,
+                'loader_path': os.path.join(temp_dir, 'ld-linux-x86-64.so.2'),
+            }
+            with mock.patch.object(libc_tool, 'list_default_libc_candidates', return_value=[libc_path]), \
+                    mock.patch.object(libc_tool, 'inspect_local_runtime_dir_for_libc', return_value=probe), \
+                    mock.patch.object(libc_tool, 'describe_local_libc', return_value='Ubuntu GLIBC 2.43'):
+                local_runtime = libc_tool.find_local_runtime_for_docker(elf_path)
+
+            self.assertEqual(local_runtime['libc_path'], libc_path)
+            self.assertEqual(local_runtime['runtime_dir'], temp_dir)
+            self.assertEqual(local_runtime['version'], 'Ubuntu GLIBC 2.43')
+
     def test_docker_deploy_dir_cleanup_is_guarded(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             generated_dir = os.path.join(temp_dir, '.libc_tool_docker_pwn')
@@ -277,6 +303,44 @@ class LibcToolTest(unittest.TestCase):
             self.assertIn(os.path.abspath(runtime_dir), excluded)
             self.assertIn(os.path.abspath(deploy_dir), excluded)
             self.assertIn(os.path.abspath(old_deploy_dir), excluded)
+
+            runtime_excluded = set(libc_tool.docker_runtime_exclude_paths(
+                challenge_dir,
+                deploy_dir,
+            ))
+            self.assertIn(os.path.abspath(deploy_dir), runtime_excluded)
+            self.assertIn(os.path.abspath(old_deploy_dir), runtime_excluded)
+
+            marker_path = os.path.join(challenge_dir, 'libc.so.6')
+            with open(marker_path, 'wb') as file_obj:
+                file_obj.write(b'local libc')
+            runtime_bundle = os.path.join(deploy_dir, 'bundle', 'runtime')
+            libc_tool.copy_portable_tree(
+                challenge_dir,
+                runtime_bundle,
+                exclude_paths=runtime_excluded,
+            )
+            self.assertTrue(os.path.exists(os.path.join(runtime_bundle, 'libc.so.6')))
+            self.assertFalse(os.path.exists(os.path.join(
+                runtime_bundle,
+                os.path.basename(deploy_dir),
+            )))
+
+    def test_library_scan_ignores_generated_docker_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            direct_libc = os.path.join(temp_dir, 'libc.so.6')
+            generated_dir = os.path.join(temp_dir, '.libc_tool_docker_old', 'bundle', 'challenge')
+            nested_libc = os.path.join(generated_dir, 'libc.so.6')
+            os.makedirs(generated_dir)
+            with open(direct_libc, 'wb') as file_obj:
+                file_obj.write(b'direct')
+            with open(nested_libc, 'wb') as file_obj:
+                file_obj.write(b'nested')
+
+            self.assertEqual(
+                libc_tool.find_library_artifact(temp_dir, 'libc.so.6'),
+                direct_libc,
+            )
 
 
 if __name__ == '__main__':

@@ -932,7 +932,8 @@ def find_library_artifact(root_dir, soname, require_dynamic=False):
     if not root_dir or not soname or not os.path.isdir(root_dir):
         return None
     candidates = []
-    for root, _dirs, files in os.walk(root_dir):
+    for root, dirs, files in os.walk(root_dir):
+        dirs[:] = [name for name in dirs if not name.startswith('.libc_tool_docker_')]
         for file_name in sorted(files):
             if file_name == soname:
                 priority = 0
@@ -1075,7 +1076,8 @@ def iter_patchable_shared_objects(target_dir):
         return []
     patchable = []
     seen = set()
-    for root, _dirs, files in os.walk(target_dir):
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [name for name in dirs if not name.startswith('.libc_tool_docker_')]
         for file_name in sorted(files):
             if not is_shared_object_artifact(file_name):
                 continue
@@ -1099,7 +1101,8 @@ def resolve_runtime_loader(target_dir, elf_path):
         if loader_path:
             return loader_path
     fallback = []
-    for root, _dirs, files in os.walk(target_dir):
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [name for name in dirs if not name.startswith('.libc_tool_docker_')]
         for file_name in sorted(files):
             if not is_loader_artifact_name(file_name):
                 continue
@@ -1532,6 +1535,53 @@ def inspect_local_runtime_dir_for_libc(libc_path, elf_path, extra_needed=None):
         result['ok'] = False
         result['reason'] = 'libc_mismatch'
     return result
+
+def describe_local_libc(libc_path):
+    """Return a short package/version label for a locally supplied libc."""
+    ubuntu_version = get_ubuntu_glibc_package_version(libc_path)
+    if ubuntu_version:
+        return f"Ubuntu GLIBC {ubuntu_version.split('-', 1)[0]}"
+    debian_version = get_debian_glibc_package_version(libc_path)
+    if debian_version:
+        return f"Debian GLIBC {debian_version.split('-', 1)[0]}"
+    versions = sorted(
+        value[len('glibc_'):]
+        for value in get_glibc_version_from_elf(libc_path)
+        if value.startswith('glibc_')
+    )
+    if versions:
+        return f"GLIBC {versions[-1]}"
+    return 'GLIBC unknown'
+
+def find_local_runtime_for_docker(elf_path, extra_needed=None, quiet=False):
+    """Find a directly usable libc beside an ELF without consulting the index."""
+    challenge_dir = os.path.dirname(os.path.abspath(elf_path))
+    candidates = [
+        path for path in list_default_libc_candidates(challenge_dir)
+        if os.path.basename(path).lower().startswith('libc')
+    ]
+    libc_path = choose_default_libc_candidate(candidates)
+    if not libc_path:
+        return None
+
+    probe = inspect_local_runtime_dir_for_libc(
+        libc_path,
+        elf_path,
+        extra_needed=extra_needed,
+    )
+    if not probe['ok']:
+        if not quiet:
+            log.info(
+                f"检测到本地 libc {stderr_path(libc_path)}，但不能直接用于 Docker: "
+                f"{format_runtime_probe_failure(probe)}"
+            )
+        return None
+    return {
+        'libc_path': libc_path,
+        'runtime_dir': probe['target_dir'],
+        'probe': probe,
+        'version': describe_local_libc(libc_path),
+    }
 
 def format_runtime_probe_failure(result):
     reason = (result or {}).get('reason')
@@ -2747,12 +2797,32 @@ def copy_debug_only_artifact(source_file, target_file):
     shutil.copy2(source_file, debug_target)
     return debug_target
 
-def copy_shared_object_artifacts(source_dir, target_dir, wanted_names=None, overwrite=False, require_dynamic=False):
+def copy_shared_object_artifacts(
+    source_dir,
+    target_dir,
+    wanted_names=None,
+    overwrite=False,
+    require_dynamic=False,
+    exclude_paths=None,
+):
     os.makedirs(target_dir, exist_ok=True)
     copied = []
     seen = set()
     wanted = set(wanted_names or ())
-    for root, _dirs, files in os.walk(source_dir):
+    excluded = {
+        os.path.abspath(path)
+        for path in (exclude_paths or ())
+        if path
+    }
+    for root, dirs, files in os.walk(source_dir):
+        dirs[:] = [
+            name for name in dirs
+            if not any(
+                os.path.abspath(os.path.join(root, name)) == excluded_path
+                or os.path.abspath(os.path.join(root, name)).startswith(excluded_path + os.sep)
+                for excluded_path in excluded
+            )
+        ]
         for file_name in sorted(files):
             if not is_shared_object_artifact(file_name):
                 continue
@@ -6878,8 +6948,12 @@ def ensure_runtime_dir_ready_for_execution(elf_path, runtime_dir, extra_needed=N
 def prepare_runtime_dir_for_docker(args, parser, target_elf, extra_needed, extra_packages, package_hints):
     if args.dir and args.libc:
         parser.error('--dir 不能与 --libc 同时使用')
+    if getattr(args, 'prefer_local', False) and (args.dir or args.libc):
+        parser.error('--prefer-local 不能与 --dir/--libc 同时使用')
     if args.dir and extra_packages:
         parser.error('--dir 模式不支持 --extra-package，因为不会触发下载')
+    if getattr(args, 'prefer_local', False) and extra_packages:
+        parser.error('--prefer-local 模式不支持 --extra-package，因为不会触发下载')
 
     if args.dir:
         runtime_dir = os.path.abspath(args.dir)
@@ -6888,6 +6962,19 @@ def prepare_runtime_dir_for_docker(args, parser, target_elf, extra_needed, extra
             sys.exit(1)
         ensure_runtime_dir_ready_for_execution(target_elf, runtime_dir, extra_needed=extra_needed)
         return runtime_dir, None, None
+
+    if getattr(args, 'prefer_local', False):
+        local_runtime = find_local_runtime_for_docker(
+            target_elf,
+            extra_needed=extra_needed,
+        )
+        if local_runtime:
+            log.success(
+                f"使用目标目录中的本地运行库: {stderr_path(local_runtime['libc_path'])} "
+                f"({stderr_version(local_runtime['version'])})"
+            )
+            return local_runtime['runtime_dir'], local_runtime['libc_path'], None
+        log.warning('未找到可直接使用的本地运行库，回退到索引自动匹配')
 
     ensure_pwntools_loaded()
 
@@ -6902,6 +6989,17 @@ def prepare_runtime_dir_for_docker(args, parser, target_elf, extra_needed, extra
         if local_runtime['ok']:
             return local_runtime['target_dir'], libc_path, libc_candidate
     else:
+        local_runtime = find_local_runtime_for_docker(
+            target_elf,
+            extra_needed=extra_needed,
+            quiet=True,
+        )
+        if local_runtime:
+            log.info(
+                f"发现可用本地运行库 {stderr_path(local_runtime['libc_path'])} "
+                f"({stderr_version(local_runtime['version'])})；"
+                "当前仍按 ELF 自动推断选择索引候选，如需使用本地版本请加 --prefer-local"
+            )
         libc_candidate = choose_libc_candidate_for_elf(target_elf, args)
         if not libc_candidate:
             sys.exit(1)
@@ -7011,6 +7109,28 @@ def docker_challenge_exclude_paths(challenge_dir, runtime_dir, deploy_dir):
         pass
     return sorted(excluded)
 
+def docker_runtime_exclude_paths(runtime_dir, deploy_dir):
+    runtime_dir = os.path.abspath(runtime_dir)
+    deploy_dir = os.path.abspath(deploy_dir)
+    excluded = set()
+    try:
+        deploy_inside_runtime = (
+            deploy_dir != runtime_dir
+            and os.path.commonpath([runtime_dir, deploy_dir]) == runtime_dir
+        )
+    except ValueError:
+        deploy_inside_runtime = False
+    if deploy_inside_runtime:
+        excluded.add(deploy_dir)
+    try:
+        with os.scandir(runtime_dir) as entries:
+            for entry in entries:
+                if entry.name.startswith('.libc_tool_docker_'):
+                    excluded.add(os.path.abspath(entry.path))
+    except OSError:
+        pass
+    return sorted(excluded)
+
 def copy_docker_template_assets(deploy_dir, template_profile):
     assets = template_profile.get('assets', {})
     launcher = template_profile.get('launcher')
@@ -7083,6 +7203,9 @@ def generate_docker_bundle(
     elf_path = os.path.abspath(elf_path)
     runtime_dir = os.path.abspath(runtime_dir)
     deploy_dir = os.path.abspath(deploy_dir)
+
+    if deploy_dir in {challenge_dir, runtime_dir}:
+        raise RuntimeError('Docker 部署目录不能与 challenge/runtime 目录相同')
 
     try:
         if os.path.commonpath([elf_path, challenge_dir]) != challenge_dir:
@@ -7165,7 +7288,14 @@ def generate_docker_bundle(
             deploy_dir,
         ),
     )
-    copy_portable_tree(runtime_dir, bundle_runtime_host)
+    reset_generated_path(bundle_runtime_host)
+    copy_shared_object_artifacts(
+        runtime_dir,
+        bundle_runtime_host,
+        overwrite=True,
+        require_dynamic=True,
+        exclude_paths=docker_runtime_exclude_paths(runtime_dir, deploy_dir),
+    )
     copy_docker_template_assets(deploy_dir, template_profile)
     write_generated_file(
         os.path.join(deploy_dir, 'Dockerfile'),
@@ -7887,6 +8017,7 @@ def build_cli_parser():
     docker_parser.add_argument('elf', nargs='?', help='目标 ELF 路径；在 --down/--destroy 模式下可省略')
     docker_parser.add_argument('--libc', default=None, help='显式指定 libc.so.6 文件；若同目录已有完整运行库则直接使用，否则回退到下载')
     docker_parser.add_argument('--dir', default=None, help='直接使用已有运行库目录生成 Docker 环境，不触发下载')
+    docker_parser.add_argument('--prefer-local', action='store_true', help='优先使用目标 ELF 同目录中可验证的本地 libc.so.6，而不是索引自动匹配')
     docker_parser.add_argument('--output-dir', default=None, help='指定自动下载运行库输出目录，默认使用目标 ELF 同目录下的 libc_dir')
     docker_parser.add_argument('--challenge-dir', default=None, help='挂载到容器内 /challenge 的宿主机目录，默认使用目标 ELF 所在目录')
     docker_parser.add_argument('--deploy-dir', default=None, help='生成 Docker 部署文件的目录，默认使用目标 ELF 同目录下的隐藏目录')
